@@ -1,16 +1,10 @@
 from datetime import date, datetime, timedelta
 import math
+import hashlib
 import requests
+import numpy as np
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-
-# ============================================================
-# MLB BETTING HUB V4.1.1
-# HOTFIX SINGLE-FILE:
-# Toda la lógica de datos + modelo vive dentro de app.py.
-# Esto evita errores de importación entre app.py/model.py/data_mlb.py.
-# ============================================================
-
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
@@ -96,11 +90,15 @@ def get_pitcher_stats(player_id,season):
         bb=float(s.get("baseOnBalls",0) or 0)
         hr=float(s.get("homeRuns",0) or 0)
         gs=int(s.get("gamesStarted",0) or 0)
+        bf=float(s.get("battersFaced",0) or 0)
         return {
             "hand":hand,"era":float(s.get("era",4.2) or 4.2),"whip":float(s.get("whip",1.28) or 1.28),
-            "innings":ip,"games_started":gs,
+            "innings":ip,"games_started":gs,"batters_faced":bf,
             "k9":so*9/ip if ip else 8.6,"bb9":bb*9/ip if ip else 3.2,"hr9":hr*9/ip if ip else 1.2,
-            "strikeouts":so,"expected_ip":min(6.3,max(4.5,ip/gs if gs else 5.2)),
+            "strikeouts":so,"walks":bb,"home_runs":hr,
+            "k_rate":so/bf if bf else None,
+            "bb_rate":bb/bf if bf else None,
+            "expected_ip":min(6.3,max(4.5,ip/gs if gs else 5.2)),
         }
     except Exception:return None
 
@@ -240,400 +238,569 @@ def get_weather(lat,lon,date_str,game_time=None):
                 "precip_probability":float(pop[idx]) if idx<len(pop) else 0}
     except Exception:return None
 
-# ================= MODEL LAYER =================
-LEAGUE_RPG=4.40; LEAGUE_ERA=4.20; LEAGUE_WHIP=1.28
-LEAGUE_K9=8.60; LEAGUE_BB9=3.20; LEAGUE_HR9=1.20; LEAGUE_OPS=.720
-BASE_F5=LEAGUE_RPG*(5/9); BASE_REST=LEAGUE_RPG*(4/9)
 
-def clamp(x,lo,hi):return max(lo,min(hi,x))
-def expected_value_decimal(p,odds):return p*odds-1
-def prob_to_decimal(p):return 1/p if p>0 else float("inf")
-def min_target_odds(p,target_ev=.05):return (1+target_ev)/p if p>0 else float("inf")
-def poisson_pmf(k,lam):return math.exp(-lam)*(lam**k)/math.factorial(k)
+
+# ================= MODEL LAYER V5 =================
+LEAGUE_RPG=4.40
+LEAGUE_ERA=4.20
+LEAGUE_WHIP=1.28
+LEAGUE_K9=8.60
+LEAGUE_BB9=3.20
+LEAGUE_HR9=1.20
+LEAGUE_OPS=.720
+LEAGUE_HIT_PA=.225
+LEAGUE_TB_PA=.335
+LEAGUE_HR_PA=.032
+LEAGUE_K_PA=.222
+BASE_F5=LEAGUE_RPG*(5/9)
+BASE_REST=LEAGUE_RPG*(4/9)
+
+def clamp(x,lo,hi):
+    return max(lo,min(hi,x))
+
+def expected_value_decimal(p,odds):
+    return p*odds-1
+
+def prob_to_decimal(p):
+    return 1/p if p>0 else float("inf")
+
+def min_target_odds(p,target_ev=.05):
+    return (1+target_ev)/p if p>0 else float("inf")
+
+def stable_seed(*parts):
+    raw="|".join(str(x) for x in parts).encode("utf-8")
+    return int(hashlib.sha256(raw).hexdigest()[:8],16)
+
+def shrink_mean(observed, sample_n, prior_mean, prior_n):
+    sample_n=max(float(sample_n or 0),0)
+    return (observed*sample_n + prior_mean*prior_n)/(sample_n+prior_n)
 
 def weather_factor(w):
-    if not w:return 1.0
-    f=1.0;t=w.get("temp_f",72);h=w.get("humidity",50);wind=w.get("wind_mph",5)
+    if not w:
+        return 1.0
+    f=1.0
+    t=w.get("temp_f",72)
+    h=w.get("humidity",50)
+    wind=w.get("wind_mph",5)
+    rain=w.get("precip_probability",0)
     if t>=90:f+=.025
-    elif t>=82:f+=.015
-    elif t<=50:f-=.020
+    elif t>=82:f+=.012
+    elif t<=50:f-=.018
     elif t<=58:f-=.010
-    if h>=75:f+=.005
-    if wind>=15:f+=.010
-    return clamp(f,.95,1.06)
+    if h>=75:f+=.004
+    if wind>=15:f+=.008
+    if rain>=60:f-=.006
+    return clamp(f,.95,1.055)
 
-def pitcher_quality_factor(p):
-    if not p:return 1.0
-    era=clamp(p["era"]/LEAGUE_ERA,.65,1.55)
-    whip=clamp(p["whip"]/LEAGUE_WHIP,.75,1.40)
-    k=clamp(LEAGUE_K9/max(p["k9"],.1),.80,1.20)
-    bb=clamp(p["bb9"]/LEAGUE_BB9,.75,1.30)
-    hr=clamp(p["hr9"]/LEAGUE_HR9,.70,1.40)
-    raw=.38*era+.22*whip+.16*k+.10*bb+.14*hr
-    sample=clamp(p.get("games_started",0)/14,.30,1.0)
-    return 1+(raw-1)*sample
+def offense_components(offense):
+    season=offense.get("season_rpg",LEAGUE_RPG)
+    recent=offense.get("recent_rpg",season)
+    games=max(offense.get("games",0),1)
+    recent_games=max(offense.get("recent_games",0),1)
 
-def lineup_strength_factor(lineup,confirmed):
-    if not lineup:return 1.0
-    weights=[1.10,1.09,1.08,1.07,1.04,1.00,.96,.92,.89][:len(lineup)]
-    ops=sum(p["ops"]*w for p,w in zip(lineup,weights))/sum(weights)
-    ratio=clamp(ops/LEAGUE_OPS,.80,1.25)
-    f=1+(ratio-1)*.35
-    if not confirmed:f=1+(f-1)*.40
-    return clamp(f,.92,1.08)
+    season_reg=shrink_mean(season,games,LEAGUE_RPG,25)
+    recent_reg=shrink_mean(recent,recent_games,season_reg,18)
 
-def offense_factor(offense):
-    blended=.70*offense["season_rpg"]+.30*offense["recent_rpg"]
-    return clamp(blended/LEAGUE_RPG,.70,1.35)
+    conservative=.78*season_reg+.22*LEAGUE_RPG
+    balanced=.72*season_reg+.28*recent_reg
+    recent_sensitive=.58*season_reg+.42*recent_reg
 
-def project_f5_runs(offense,opposing_pitcher,lineup,lineup_confirmed,park_factor=1.0,weather=None):
-    of=offense_factor(offense);pf=pitcher_quality_factor(opposing_pitcher)
-    lf=lineup_strength_factor(lineup,lineup_confirmed)
-    park=clamp(park_factor,.92,1.12);wf=weather_factor(weather)
-    proj=clamp(BASE_F5*of*pf*lf*park*wf,.60,4.50)
-    return proj,{"offense_factor":round(of,3),"pitcher_factor":round(pf,3),
-                 "lineup_factor":round(lf,3),"park_factor":round(park,3),
-                 "weather_factor":round(wf,3),"projected_runs":round(proj,3)}
-
-def staff_proxy_factor(staff):
-    if not staff:return 1.0
-    era=clamp(staff["era"]/LEAGUE_ERA,.75,1.35)
-    whip=clamp(staff["whip"]/LEAGUE_WHIP,.80,1.30)
-    recent=clamp(staff["recent_ra_pg"]/LEAGUE_RPG,.75,1.35)
-    return clamp(.45*era+.20*whip+.35*recent,.78,1.30)
-
-def project_full_game_runs_v4(away_f5,home_f5,away_form,home_form,away_staff,home_staff,park_factor=1.0,weather=None):
-    park=clamp(park_factor,.92,1.12);wf=weather_factor(weather)
-    away_of=offense_factor(away_form);home_of=offense_factor(home_form)
-    home_bp=staff_proxy_factor(home_staff);away_bp=staff_proxy_factor(away_staff)
-    away_rest=BASE_REST*away_of*home_bp*park*wf
-    home_rest=BASE_REST*home_of*away_bp*park*wf
-    away=clamp(away_f5+away_rest,1.5,9.5)
-    home=clamp(home_f5+home_rest,1.5,9.5)
-    return away,home,{
-        "away_f5":round(away_f5,3),"home_f5":round(home_f5,3),
-        "away_remaining_innings":round(away_rest,3),"home_remaining_innings":round(home_rest,3),
-        "home_staff_factor":round(home_bp,3),"away_staff_factor":round(away_bp,3)
+    return {
+        "conservative":clamp(conservative/LEAGUE_RPG,.78,1.26),
+        "balanced":clamp(balanced/LEAGUE_RPG,.76,1.30),
+        "recent":clamp(recent_sensitive/LEAGUE_RPG,.74,1.34),
+        "season_reg":season_reg,
+        "recent_reg":recent_reg,
     }
 
-def total_probabilities(lam,line):
-    u=o=push=0.0
-    for k in range(0,30):
-        p=poisson_pmf(k,lam)
-        if k<line:u+=p
-        elif k>line:o+=p
-        else:push+=p
-    t=u+o+push
-    if t:u/=t;o/=t;push/=t
-    if abs(line-round(line))<1e-9 and (u+o)>0:
-        nt=u+o;u/=nt;o/=nt
-    return {"under":u,"over":o,"push":push}
+def pitcher_components(p):
+    if not p:
+        return {"conservative":1.0,"balanced":1.0,"skills":1.0,"sample":0.35}
 
-def moneyline_probabilities(la,lh,max_runs=20):
-    a=h=tie=0.0
-    for x in range(max_runs+1):
-        px=poisson_pmf(x,la)
-        for y in range(max_runs+1):
-            py=poisson_pmf(y,lh);p=px*py
-            if x>y:a+=p
-            elif y>x:h+=p
-            else:tie+=p
-    s=a+h+tie
-    if s:a/=s;h/=s;tie/=s
-    return {"away":a,"home":h,"tie":tie}
+    ip=max(float(p.get("innings",0) or 0),0)
+    gs=max(int(p.get("games_started",0) or 0),0)
+    sample=clamp(ip/90,.25,1.0)
 
-def central_run_range(lam,low=.20,high=.80):
-    cdf=0.0;lo=0;hi=0;lo_found=False
-    for k in range(0,35):
-        cdf+=poisson_pmf(k,lam)
-        if not lo_found and cdf>=low:
-            lo=k;lo_found=True
-        if cdf>=high:
-            hi=k;break
-    return lo,hi
+    era=shrink_mean(float(p.get("era",LEAGUE_ERA)),ip,LEAGUE_ERA,45)
+    whip=shrink_mean(float(p.get("whip",LEAGUE_WHIP)),ip,LEAGUE_WHIP,50)
+    k9=shrink_mean(float(p.get("k9",LEAGUE_K9)),ip,LEAGUE_K9,45)
+    bb9=shrink_mean(float(p.get("bb9",LEAGUE_BB9)),ip,LEAGUE_BB9,45)
+    hr9=shrink_mean(float(p.get("hr9",LEAGUE_HR9)),ip,LEAGUE_HR9,50)
 
-def poisson_tail(lam,threshold):
-    if threshold<=0:return 1.0
-    return 1-sum(poisson_pmf(k,lam) for k in range(threshold))
+    era_f=clamp(era/LEAGUE_ERA,.72,1.38)
+    whip_f=clamp(whip/LEAGUE_WHIP,.78,1.30)
+    k_f=clamp(LEAGUE_K9/max(k9,.1),.82,1.18)
+    bb_f=clamp(bb9/LEAGUE_BB9,.78,1.24)
+    hr_f=clamp(hr9/LEAGUE_HR9,.78,1.28)
+
+    conservative=.52*era_f+.26*whip_f+.12*k_f+.10*bb_f
+    balanced=.34*era_f+.25*whip_f+.18*k_f+.10*bb_f+.13*hr_f
+    skills=.20*era_f+.20*whip_f+.27*k_f+.14*bb_f+.19*hr_f
+
+    # Partial regression of extreme factor toward neutral when sample is small.
+    def reg(f):
+        return 1+(f-1)*sample
+
+    return {
+        "conservative":clamp(reg(conservative),.76,1.34),
+        "balanced":clamp(reg(balanced),.74,1.36),
+        "skills":clamp(reg(skills),.73,1.38),
+        "sample":sample,
+        "era_reg":era,"whip_reg":whip,"k9_reg":k9,"bb9_reg":bb9,"hr9_reg":hr9
+    }
+
+def lineup_component(lineup,confirmed):
+    if not lineup:
+        return {"factor":1.0,"quality":0.45,"ops":LEAGUE_OPS}
+    weights=[1.12,1.10,1.08,1.06,1.03,1.00,.97,.94,.91][:len(lineup)]
+    vals=[]
+    used_weights=[]
+    for p,w in zip(lineup,weights):
+        if not p.get("stats_available"):
+            continue
+        pa=max(int(p.get("pa",0) or 0),0)
+        ops=shrink_mean(float(p.get("ops",LEAGUE_OPS)),pa,LEAGUE_OPS,100)
+        vals.append(ops*w)
+        used_weights.append(w)
+    if not vals:
+        return {"factor":1.0,"quality":0.45,"ops":LEAGUE_OPS}
+    avg=sum(vals)/sum(used_weights)
+    raw=clamp(avg/LEAGUE_OPS,.84,1.18)
+    strength=1+(raw-1)*.42
+    if not confirmed:
+        strength=1+(strength-1)*.40
+    quality=.95 if confirmed and len(vals)>=8 else .68 if len(vals)>=6 else .52
+    return {"factor":clamp(strength,.93,1.08),"quality":quality,"ops":avg}
+
+def project_f5_ensemble(offense,opposing_pitcher,lineup,lineup_confirmed,park_factor=1.0,weather=None):
+    off=offense_components(offense)
+    pit=pitcher_components(opposing_pitcher)
+    lu=lineup_component(lineup,lineup_confirmed)
+    park=clamp(park_factor,.93,1.10)
+    wf=weather_factor(weather)
+
+    lambdas=[
+        BASE_F5*off["conservative"]*pit["conservative"]*park,
+        BASE_F5*off["balanced"]*pit["balanced"]*lu["factor"]*park*wf,
+        BASE_F5*off["recent"]*pit["skills"]*lu["factor"]*park*wf,
+    ]
+    lambdas=[clamp(x,.65,4.40) for x in lambdas]
+    weights=np.array([.30,.45,.25])
+    mean=float(np.average(lambdas,weights=weights))
+    disagreement=float(np.std(lambdas))
+
+    return mean,{
+        "model_lambdas":[round(x,3) for x in lambdas],
+        "model_disagreement":round(disagreement,3),
+        "offense_season_reg":round(off["season_reg"],3),
+        "offense_recent_reg":round(off["recent_reg"],3),
+        "pitcher_era_reg":round(pit.get("era_reg",LEAGUE_ERA),3),
+        "pitcher_k9_reg":round(pit.get("k9_reg",LEAGUE_K9),3),
+        "lineup_ops_reg":round(lu["ops"],3),
+        "lineup_factor":round(lu["factor"],3),
+        "park_factor":round(park,3),
+        "weather_factor":round(wf,3),
+        "projected_runs":round(mean,3),
+    }
+
+def staff_proxy_factor(staff):
+    if not staff:
+        return 1.0
+    era=shrink_mean(float(staff.get("era",LEAGUE_ERA)),80,LEAGUE_ERA,60)
+    whip=shrink_mean(float(staff.get("whip",LEAGUE_WHIP)),80,LEAGUE_WHIP,60)
+    recent=shrink_mean(float(staff.get("recent_ra_pg",LEAGUE_RPG)),10,LEAGUE_RPG,15)
+    return clamp(.43*(era/LEAGUE_ERA)+.22*(whip/LEAGUE_WHIP)+.35*(recent/LEAGUE_RPG),.82,1.24)
+
+def project_full_game_ensemble(away_f5,home_f5,away_form,home_form,away_staff,home_staff,park_factor=1.0,weather=None):
+    park=clamp(park_factor,.93,1.10)
+    wf=weather_factor(weather)
+    ao=offense_components(away_form)
+    ho=offense_components(home_form)
+    home_bp=staff_proxy_factor(home_staff)
+    away_bp=staff_proxy_factor(away_staff)
+
+    away_rest=BASE_REST*ao["balanced"]*home_bp*park*wf
+    home_rest=BASE_REST*ho["balanced"]*away_bp*park*wf
+
+    away=clamp(away_f5+away_rest,1.5,9.2)
+    home=clamp(home_f5+home_rest,1.5,9.2)
+
+    return away,home,{
+        "away_remaining":round(away_rest,3),
+        "home_remaining":round(home_rest,3),
+        "away_staff_factor":round(away_bp,3),
+        "home_staff_factor":round(home_bp,3),
+        "projected_total":round(away+home,3)
+    }
+
+def simulate_run_environment(away_lambda,home_lambda,quality,confirmed,seed,n=24000,full_game=False,model_disagreement=0.0):
+    rng=np.random.default_rng(seed)
+
+    # Parameter uncertainty is explicitly simulated by drawing the latent run rate.
+    # Lower quality / missing lineups = wider parameter distribution.
+    base_cv=.10 if confirmed else .16
+    if full_game:
+        base_cv+=.035
+    base_cv+=clamp(model_disagreement/3,.0,.05)
+    base_cv+=clamp((80-quality)/500,0,.06)
+    base_cv=clamp(base_cv,.08,.25)
+
+    def gamma_poisson(mu):
+        shape=1/(base_cv**2)
+        scale=mu/shape
+        latent=rng.gamma(shape,scale,size=n)
+        return rng.poisson(latent)
+
+    away=gamma_poisson(away_lambda)
+    home=gamma_poisson(home_lambda)
+    total=away+home
+    return {"away":away,"home":home,"total":total,"cv":base_cv}
+
+def sim_total_prob(sim,line,direction):
+    arr=sim["total"]
+    if direction=="over":
+        return float(np.mean(arr>line))
+    return float(np.mean(arr<line))
+
+def sim_ml_prob(sim,side):
+    a=sim["away"];h=sim["home"]
+    non_tie=a!=h
+    if not np.any(non_tie):
+        return .5
+    if side=="away":
+        return float(np.mean(a[non_tie]>h[non_tie]))
+    return float(np.mean(h[non_tie]>a[non_tie]))
+
+def scenario_total_probs(lambdas_away,lambdas_home,line,direction):
+    probs=[]
+    for a,h in zip(lambdas_away,lambdas_home):
+        lam=max(a+h,.05)
+        # deterministic Poisson scenario used only to measure model disagreement.
+        maxk=35
+        pmf=[math.exp(-lam)*(lam**k)/math.factorial(k) for k in range(maxk)]
+        if direction=="over":
+            p=sum(pmf[k] for k in range(maxk) if k>line)
+        else:
+            p=sum(pmf[k] for k in range(maxk) if k<line)
+        probs.append(clamp(p,0,1))
+    return probs
+
+def conservative_probability(center,scenario_probs,quality,confirmed,volatility):
+    if scenario_probs:
+        low=min(scenario_probs)
+        high=max(scenario_probs)
+        agreement=1-(high-low)
+    else:
+        low=high=center
+        agreement=1.0
+
+    # Conservative displayed probability: shrink toward 50% according to uncertainty.
+    shrink=.97
+    if not confirmed: shrink-=.08
+    if quality<80: shrink-=min(.10,(80-quality)/200)
+    if volatility=="high": shrink-=.08
+    elif volatility=="medium": shrink-=.03
+    shrink=clamp(shrink,.72,.97)
+    adjusted=.5+(center-.5)*shrink
+
+    lo=clamp(min(low,adjusted)-(.025 if not confirmed else .012),.01,.99)
+    hi=clamp(max(high,adjusted)+.025,.01,.99)
+    return adjusted,lo,hi,clamp(agreement,0,1)
+
+def beta_binomial_event_prob(rate,pa,threshold,prior_rate,prior_strength,sample_n):
+    # Bayesian shrinkage of the underlying per-PA event rate.
+    shr=shrink_mean(rate,sample_n,prior_rate,prior_strength)
+    n=max(1,int(round(pa)))
+    # Binomial event distribution is more appropriate than Poisson for PA-level yes/no events.
+    p=0.0
+    for k in range(threshold,n+1):
+        p += math.comb(n,k)*(shr**k)*((1-shr)**(n-k))
+    return clamp(p,0,1),shr,n
 
 def expected_pa(order):
     return {1:4.55,2:4.50,3:4.45,4:4.35,5:4.25,6:4.10,7:4.00,8:3.90,9:3.80}.get(order,4.10)
 
-def prob_at_least_one(rate,pa):
-    rate=clamp(rate,0,.95)
-    return 1-(1-rate)**pa
-
-def build_prop_candidates(away_pitcher,home_pitcher,away_pitcher_name,home_pitcher_name,
-                          away_lineup,home_lineup,away_team,home_team,lineups_confirmed=False):
+def build_prop_candidates_v5(away_pitcher,home_pitcher,away_pitcher_name,home_pitcher_name,
+                             away_lineup,home_lineup,lineups_confirmed=False):
     props=[]
+
     for name,p,opp_lineup in [
         (away_pitcher_name,away_pitcher,home_lineup),
         (home_pitcher_name,home_pitcher,away_lineup),
     ]:
         if p:
-            opp_k=.22
-            vals=[x.get("k_rate") for x in opp_lineup if x.get("stats_available")]
-            if vals:opp_k=sum(vals)/len(vals)
-            k_adj=clamp(opp_k/.22,.85,1.18)
-            mean_k=p["k9"]*p.get("expected_ip",5.2)/9*k_adj
-            for th in [4,5,6]:
-                prob=poisson_tail(mean_k,th)
+            ip=max(float(p.get("innings",0) or 0),0)
+            k9_reg=shrink_mean(float(p.get("k9",LEAGUE_K9)),ip,LEAGUE_K9,50)
+            exp_ip=shrink_mean(float(p.get("expected_ip",5.2)),max(p.get("games_started",0),1),5.2,7)
+
+            opp_rates=[x.get("k_rate") for x in opp_lineup if x.get("stats_available") and x.get("k_rate") is not None]
+            if opp_rates:
+                # Each batter rate already season based; regress team lineup K% toward league.
+                raw_opp=float(np.mean(opp_rates))
+                opp_k=shrink_mean(raw_opp,len(opp_rates)*70,LEAGUE_K_PA,300)
+            else:
+                opp_k=LEAGUE_K_PA
+
+            matchup=clamp(opp_k/LEAGUE_K_PA,.88,1.13)
+            mean_k=clamp(k9_reg*exp_ip/9*matchup,1.5,9.5)
+
+            # Negative-binomial-like uncertainty via gamma-Poisson mixture.
+            seed=stable_seed(name,"K")
+            rng=np.random.default_rng(seed)
+            cv=.16 if opp_lineup else .20
+            shape=1/(cv**2)
+            latent=rng.gamma(shape,mean_k/shape,size=18000)
+            ks=rng.poisson(latent)
+
+            for th in [4,5,6,7]:
+                center=float(np.mean(ks>=th))
+                q=84 if opp_lineup else 76
+                confirmed=True
+                # Range represents plausible parameter uncertainty, not MC sampling error.
+                lo=clamp(center-.055 if opp_lineup else center-.08,.01,.99)
+                hi=clamp(center+.055 if opp_lineup else center+.08,.01,.99)
                 props.append({
                     "category":"Pitcher Ks",
                     "label":f"{name} {th}+ ponches",
-                    "prob":prob,
-                    "reason":f"Media proyectada ~{mean_k:.1f} K; ajustada por K-rate rival.",
-                    "confirmed":True,
-                    "data_quality":78
+                    "prob":center,"prob_low":lo,"prob_high":hi,
+                    "agreement":.88 if opp_lineup else .76,
+                    "quality":q,"confirmed":confirmed,"volatility":"medium",
+                    "reason":f"K/9 regresado {k9_reg:.2f}; IP esperadas {exp_ip:.1f}; K% rival ajustado {opp_k*100:.1f}%; media ~{mean_k:.1f} K."
                 })
 
     def add_hitters(lineup):
         for p in lineup[:9]:
-            if not p.get("stats_available"): continue
+            if not p.get("stats_available"):
+                continue
             pa=expected_pa(p["order"])
+            sample=max(int(p.get("pa",0) or 0),0)
             confirmed=lineups_confirmed
-            dq=82 if confirmed else 60
+            q=88 if confirmed else 64
+            split_adj=clamp(float(p.get("ops",LEAGUE_OPS))/LEAGUE_OPS,.88,1.12)
 
-            mean_hits=p["hit_rate"]*pa
-            p1=poisson_tail(mean_hits,1)
-            p2=poisson_tail(mean_hits,2)
-            props += [
-                {"category":"Hits","label":f"{p['name']} 1+ hit","prob":p1,
-                 "reason":f"~{pa:.1f} PA desde turno #{p['order']}; media hits ~{mean_hits:.2f}.",
-                 "confirmed":confirmed,"data_quality":dq},
-                {"category":"Hits","label":f"{p['name']} 2+ hits","prob":p2,
-                 "reason":f"~{pa:.1f} PA desde turno #{p['order']}; media hits ~{mean_hits:.2f}.",
-                 "confirmed":confirmed,"data_quality":dq},
-            ]
+            hit_rate=clamp(float(p.get("hit_rate",LEAGUE_HIT_PA))*split_adj,0,.60)
+            p1,shr_hit,npa=beta_binomial_event_prob(hit_rate,pa,1,LEAGUE_HIT_PA,120,sample)
+            p2,_,_=beta_binomial_event_prob(hit_rate,pa,2,LEAGUE_HIT_PA,120,sample)
 
-            mean_tb=p["tb_rate"]*pa
-            ptb1=poisson_tail(mean_tb,1)
-            ptb2=poisson_tail(mean_tb,2)
-            props += [
-                {"category":"Total Bases","label":f"{p['name']} 1+ base total","prob":ptb1,
-                 "reason":f"Media TB ~{mean_tb:.2f}; turno #{p['order']}.",
-                 "confirmed":confirmed,"data_quality":dq},
-                {"category":"Total Bases","label":f"{p['name']} 2+ bases totales","prob":ptb2,
-                 "reason":f"Media TB ~{mean_tb:.2f}; turno #{p['order']}.",
-                 "confirmed":confirmed,"data_quality":dq},
-            ]
+            tb_rate=clamp(float(p.get("tb_rate",LEAGUE_TB_PA))*split_adj,0,.90)
+            # TB is not Bernoulli; approximate 1+ TB using probability of a hit-like TB event,
+            # and 2+ with a conservative compound-event approximation.
+            ptb1,shr_tb,_=beta_binomial_event_prob(min(tb_rate,.70),pa,1,LEAGUE_TB_PA,130,sample)
+            ptb2=clamp(ptb1*(.42+.28*clamp(shr_tb/LEAGUE_TB_PA,.7,1.4)),.05,.82)
 
-            mean_hrr=p["hrr_rate"]*pa
-            phrr=poisson_tail(mean_hrr,2)
-            props.append({"category":"HRR","label":f"{p['name']} 2+ HRR","prob":phrr,
-                          "reason":f"Media H+R+RBI ~{mean_hrr:.2f}.",
-                          "confirmed":confirmed,"data_quality":dq})
+            hr_rate=clamp(float(p.get("hr_rate",LEAGUE_HR_PA))*split_adj,0,.18)
+            phr,shr_hr,_=beta_binomial_event_prob(hr_rate,pa,1,LEAGUE_HR_PA,180,sample)
 
-            phr=prob_at_least_one(p["hr_rate"],pa)
-            props.append({"category":"Home Run","label":f"{p['name']} 1+ HR","prob":phr,
-                          "reason":f"Mercado de alta varianza; ~{pa:.1f} PA esperadas.",
-                          "confirmed":confirmed,"data_quality":max(50,dq-10)})
+            def rng_band(center,vol):
+                width=.045 if confirmed else .075
+                if vol=="high": width+=.055
+                return clamp(center-width,.01,.99),clamp(center+width,.01,.99)
+
+            for label,prob,vol,detail in [
+                (f"{p['name']} 1+ hit",p1,"low",f"Hit/PA regresado {shr_hit:.3f}; ~{pa:.1f} PA; turno #{p['order']}."),
+                (f"{p['name']} 2+ hits",p2,"medium",f"Hit/PA regresado {shr_hit:.3f}; ~{pa:.1f} PA; turno #{p['order']}."),
+                (f"{p['name']} 1+ base total",ptb1,"low",f"TB/PA regresado {shr_tb:.3f}; ~{pa:.1f} PA; turno #{p['order']}."),
+                (f"{p['name']} 2+ bases totales",ptb2,"medium",f"TB/PA regresado {shr_tb:.3f}; ~{pa:.1f} PA; turno #{p['order']}."),
+                (f"{p['name']} 1+ HR",phr,"high",f"HR/PA regresado {shr_hr:.3f}; mercado de alta varianza."),
+            ]:
+                lo,hi=rng_band(prob,vol)
+                props.append({
+                    "category":"Home Run" if "HR" in label else "Hits" if "hit" in label else "Total Bases",
+                    "label":label,"prob":prob,"prob_low":lo,"prob_high":hi,
+                    "agreement":.90 if confirmed else .72,
+                    "quality":q if vol!="high" else max(55,q-12),
+                    "confirmed":confirmed,"volatility":vol,"reason":detail
+                })
 
     add_hitters(away_lineup)
     add_hitters(home_lineup)
     return props
 
-def _auto_score(item):
+def confidence_score(item):
     p=item["prob"]
+    low=item.get("prob_low",p)
+    high=item.get("prob_high",p)
     q=item.get("quality",65)/100
-    confirmed=item.get("confirmed",False)
+    agreement=item.get("agreement",.75)
+    confirmed=1.0 if item.get("confirmed",False) else .72
     volatility=item.get("volatility","medium")
+    width=high-low
+    stability=clamp(1-width/.30,0,1)
+    prob_strength=clamp((low-.50)/.25,0,1)
 
-    # Queremos "qué buscar" antes de conocer el momio:
-    # priorizamos probabilidad + calidad + estabilidad, no EV.
-    prob_component = clamp((p-.48)/.32, 0, 1)
-    conf_component = q
-    confirmed_bonus = .06 if confirmed else 0
-    volatility_penalty = .10 if volatility=="high" else .03 if volatility=="medium" else 0
-    beta_penalty = .08 if "BETA" in item.get("category","") else 0
-    return prob_component*.62 + conf_component*.32 + confirmed_bonus - volatility_penalty - beta_penalty
+    vol_mult={"low":1.0,"medium":.92,"high":.76}.get(volatility,.90)
+    score=100*(.36*prob_strength+.24*q+.22*agreement+.18*stability)*confirmed*vol_mult
+    return int(round(clamp(score,0,99)))
 
-def rank_automatic_candidates(items,max_items=5):
+def rank_automatic_candidates_v5(items,max_items=5):
     ranked=[]
     for item in items:
-        if item["prob"] < .54:
-            continue
         x=dict(item)
-        x["auto_score"]=_auto_score(x)
-        if x["auto_score"]>=.62:
-            x["auto_grade"]="ALTA"
-        elif x["auto_score"]>=.48:
-            x["auto_grade"]="MEDIA"
-        else:
-            x["auto_grade"]="BAJA"
+        x["confidence_score"]=confidence_score(x)
+        # Use the conservative lower bound as the admission filter.
+        if x.get("prob_low",x["prob"]) < .54:
+            continue
+        if x["confidence_score"] < 48:
+            continue
         ranked.append(x)
 
-    ranked=sorted(ranked,key=lambda x:(x["auto_score"],x["prob"]),reverse=True)
+    ranked=sorted(
+        ranked,
+        key=lambda x:(x["confidence_score"],x.get("prob_low",x["prob"]),x["prob"]),
+        reverse=True
+    )
 
-    # Diversidad: no queremos 5 props casi iguales del mismo pitcher/jugador.
+    # Diversity: at most 2 from same player/base market prefix and at most 2 from same category.
     selected=[]
-    seen_prefix={}
+    prefix_counts={}
+    cat_counts={}
     for item in ranked:
-        prefix=item["label"].split(" 1+")[0].split(" 2+")[0].split(" 3+")[0].split(" 4+")[0].split(" 5+")[0].split(" 6+")[0]
-        count=seen_prefix.get(prefix,0)
-        if count>=2:
+        label=item["label"]
+        prefix=label
+        for token in [" 1+"," 2+"," 3+"," 4+"," 5+"," 6+"," 7+"," Over "," Under "]:
+            if token in prefix:
+                prefix=prefix.split(token)[0]
+                break
+        if prefix_counts.get(prefix,0)>=2:
+            continue
+        if cat_counts.get(item["category"],0)>=2:
             continue
         selected.append(item)
-        seen_prefix[prefix]=count+1
+        prefix_counts[prefix]=prefix_counts.get(prefix,0)+1
+        cat_counts[item["category"]]=cat_counts.get(item["category"],0)+1
         if len(selected)>=max_items:
             break
     return selected
 
-def evaluate_selected_candidate(item,odds):
+def evaluate_selected_candidate_v5(item,odds):
+    # For price decisions, use central probability but penalize uncertainty.
     p=item["prob"]
-    ev=expected_value_decimal(p,odds)
+    p_cons=item.get("prob_low",p)
     fair=prob_to_decimal(p)
-    target=min_target_odds(p)
-    edge_price = odds/target - 1
+    fair_conservative=prob_to_decimal(p_cons)
+    ev=p*odds-1
+    conservative_ev=p_cons*odds-1
+    target=(1.05/max(p_cons,.01))
 
-    if ev>=.08 and odds>=target:
+    if conservative_ev>=.06 and odds>=target and item.get("confidence_score",0)>=60:
         verdict="APOSTAR"
-    elif ev>=.03 and odds>=fair:
+    elif conservative_ev>=.015 and odds>=fair_conservative:
         verdict="LEAN"
     else:
         verdict="PASS"
 
-    quality=item.get("quality",65)/100
-    score=ev*quality
-    if not item.get("confirmed",False):
-        score*=.88
-
+    score=conservative_ev*(item.get("confidence_score",50)/100)
     return {
         "ev":ev,
+        "conservative_ev":conservative_ev,
         "fair_odds":fair,
+        "fair_conservative":fair_conservative,
         "target_odds":target,
-        "edge_price":edge_price,
         "verdict":verdict,
         "score":score
     }
 
+
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V4.2", page_icon="⚾", layout="wide")
-st_autorefresh(interval=120000, key="v42_refresh")
+st.set_page_config(page_title="MLB Betting Hub V5", page_icon="⚾", layout="wide")
+st_autorefresh(interval=120000, key="v5_refresh")
 
-st.title("⚾ MLB Betting Hub — V4.2")
-st.caption("Consulta el contexto del juego, actualiza datos cuando quieras y analiza solo cuando tú lo decidas.")
+st.title("⚾ MLB Betting Hub — V5")
+st.caption("Motor estadístico mejorado: regresión a la media + ensemble + simulación + incertidumbre.")
 
-# =========================
-# Selección mínima
-# =========================
-c1, c2 = st.columns([1,2])
+c1,c2=st.columns([1,2])
 with c1:
-    selected_date = st.date_input("📅 Fecha", value=date.today())
+    selected_date=st.date_input("📅 Fecha",value=date.today())
 
-games = get_schedule(selected_date.isoformat())
+games=get_schedule(selected_date.isoformat())
 if not games:
     st.warning("No encontré partidos MLB para esta fecha o MLB no respondió.")
     st.stop()
 
 with c2:
-    game_label = st.selectbox("⚾ Partido", [g["label"] for g in games])
+    game_label=st.selectbox("⚾ Partido",[g["label"] for g in games])
 
-game = next(g for g in games if g["label"] == game_label)
+game=next(g for g in games if g["label"]==game_label)
 
-# Si cambia la fecha o el partido, pedimos un nuevo análisis.
-game_state_key = f"{selected_date.isoformat()}-{game['game_pk']}"
-if st.session_state.get("v42_game_key") != game_state_key:
-    st.session_state["v42_game_key"] = game_state_key
-    st.session_state["v42_analysis_ready"] = False
+game_state_key=f"{selected_date.isoformat()}-{game['game_pk']}"
+if st.session_state.get("v5_game_key")!=game_state_key:
+    st.session_state["v5_game_key"]=game_state_key
+    st.session_state["v5_analysis_ready"]=False
 
-# =========================
-# Datos automáticos
-# =========================
-with st.spinner("Analizando partido automáticamente..."):
-    away_form = get_team_form(game["away_id"], selected_date.isoformat())
-    home_form = get_team_form(game["home_id"], selected_date.isoformat())
+with st.spinner("Consultando MLB, contexto y lineups..."):
+    away_form=get_team_form(game["away_id"],selected_date.isoformat())
+    home_form=get_team_form(game["home_id"],selected_date.isoformat())
+    away_pitch=get_pitcher_stats(game["away_pitcher_id"],selected_date.year) if game["away_pitcher_id"] else None
+    home_pitch=get_pitcher_stats(game["home_pitcher_id"],selected_date.year) if game["home_pitcher_id"] else None
+    away_staff=get_team_pitching_profile(game["away_id"],selected_date.year,selected_date.isoformat())
+    home_staff=get_team_pitching_profile(game["home_id"],selected_date.year,selected_date.isoformat())
 
-    away_pitch = get_pitcher_stats(game["away_pitcher_id"], selected_date.year) if game["away_pitcher_id"] else None
-    home_pitch = get_pitcher_stats(game["home_pitcher_id"], selected_date.year) if game["home_pitcher_id"] else None
+    park=get_stadium_context(game["home_abbr"])
+    weather=get_weather(park["lat"],park["lon"],selected_date.isoformat(),game.get("game_time_local")) if park else None
 
-    away_staff = get_team_pitching_profile(game["away_id"], selected_date.year, selected_date.isoformat())
-    home_staff = get_team_pitching_profile(game["home_id"], selected_date.year, selected_date.isoformat())
+    raw_lineups=get_lineups(game["game_pk"])
+    away_lineup=enrich_lineup(raw_lineups.get("away",[]),selected_date.year,(home_pitch or {}).get("hand","R"))
+    home_lineup=enrich_lineup(raw_lineups.get("home",[]),selected_date.year,(away_pitch or {}).get("hand","R"))
 
-    park = get_stadium_context(game["home_abbr"])
-    weather = get_weather(
-        park["lat"], park["lon"], selected_date.isoformat(), game.get("game_time_local")
-    ) if park else None
+away_confirmed=len(away_lineup)>=9
+home_confirmed=len(home_lineup)>=9
+both_confirmed=away_confirmed and home_confirmed
 
-    raw_lineups = get_lineups(game["game_pk"])
-    away_lineup = enrich_lineup(
-        raw_lineups.get("away", []), selected_date.year, (home_pitch or {}).get("hand", "R")
-    )
-    home_lineup = enrich_lineup(
-        raw_lineups.get("home", []), selected_date.year, (away_pitch or {}).get("hand", "R")
-    )
-
-away_confirmed = len(away_lineup) >= 9
-home_confirmed = len(home_lineup) >= 9
-both_confirmed = away_confirmed and home_confirmed
-
-# calidad
-quality = 100
-quality_notes = []
+quality=100
+quality_notes=[]
 if not game["away_pitcher_id"] or not game["home_pitcher_id"]:
-    quality -= 18
-    quality_notes.append("⚠️ Falta al menos un abridor confirmado")
-else:
-    quality_notes.append("✅ Abridores confirmados")
+    quality-=18;quality_notes.append("⚠️ Falta al menos un abridor confirmado")
+else: quality_notes.append("✅ Abridores confirmados")
 if not away_confirmed:
-    quality -= 12
-    quality_notes.append(f"⚠️ Lineup {game['away_abbr']} pendiente")
-else:
-    quality_notes.append(f"✅ Lineup {game['away_abbr']} confirmado")
+    quality-=12;quality_notes.append(f"⚠️ Lineup {game['away_abbr']} pendiente")
+else: quality_notes.append(f"✅ Lineup {game['away_abbr']} confirmado")
 if not home_confirmed:
-    quality -= 12
-    quality_notes.append(f"⚠️ Lineup {game['home_abbr']} pendiente")
-else:
-    quality_notes.append(f"✅ Lineup {game['home_abbr']} confirmado")
+    quality-=12;quality_notes.append(f"⚠️ Lineup {game['home_abbr']} pendiente")
+else: quality_notes.append(f"✅ Lineup {game['home_abbr']} confirmado")
 if weather is None:
-    quality -= 8
-    quality_notes.append("⚠️ Clima no disponible")
-else:
-    quality_notes.append("✅ Clima disponible")
+    quality-=8;quality_notes.append("⚠️ Clima no disponible")
+else: quality_notes.append("✅ Clima disponible")
 if away_staff is None or home_staff is None:
-    quality -= 8
-    quality_notes.append("⚠️ Bullpen proxy incompleto")
-else:
-    quality_notes.append("✅ Bullpen proxy disponible")
+    quality-=8;quality_notes.append("⚠️ Bullpen proxy incompleto")
+else: quality_notes.append("✅ Bullpen/staff proxy disponible")
+quality=max(30,min(100,quality))
 
-quality = max(30, min(100, quality))
-park_factor = (park or {}).get("factor", 1.0)
+park_factor=(park or {}).get("factor",1.0)
 
-away_f5, away_f5_debug = project_f5_runs(
-    away_form, home_pitch, away_lineup, away_confirmed, park_factor, weather
+away_f5,away_f5_debug=project_f5_ensemble(away_form,home_pitch,away_lineup,away_confirmed,park_factor,weather)
+home_f5,home_f5_debug=project_f5_ensemble(home_form,away_pitch,home_lineup,home_confirmed,park_factor,weather)
+f5_total=away_f5+home_f5
+
+away_fg,home_fg,fg_debug=project_full_game_ensemble(
+    away_f5,home_f5,away_form,home_form,away_staff,home_staff,park_factor,weather
 )
-home_f5, home_f5_debug = project_f5_runs(
-    home_form, away_pitch, home_lineup, home_confirmed, park_factor, weather
-)
-f5_total = away_f5 + home_f5
+fg_total=away_fg+home_fg
 
-away_fg, home_fg, fg_debug = project_full_game_runs_v4(
-    away_f5, home_f5, away_form, home_form,
-    away_staff, home_staff, park_factor, weather
+# Monte Carlo predictive distributions.
+f5_disagreement=away_f5_debug["model_disagreement"]+home_f5_debug["model_disagreement"]
+f5_sim=simulate_run_environment(
+    away_f5,home_f5,quality,both_confirmed,
+    stable_seed(game["game_pk"],selected_date.isoformat(),"F5"),
+    n=24000,full_game=False,model_disagreement=f5_disagreement
 )
-fg_total = away_fg + home_fg
-
-props = build_prop_candidates(
-    away_pitcher=away_pitch,
-    home_pitcher=home_pitch,
-    away_pitcher_name=game["away_pitcher_name"],
-    home_pitcher_name=game["home_pitcher_name"],
-    away_lineup=away_lineup,
-    home_lineup=home_lineup,
-    away_team=game["away_abbr"],
-    home_team=game["home_abbr"],
-    lineups_confirmed=both_confirmed,
+fg_sim=simulate_run_environment(
+    away_fg,home_fg,max(35,quality-10),False,
+    stable_seed(game["game_pk"],selected_date.isoformat(),"FG"),
+    n=24000,full_game=True,model_disagreement=f5_disagreement
 )
 
+props=build_prop_candidates_v5(
+    away_pitch,home_pitch,game["away_pitcher_name"],game["home_pitcher_name"],
+    away_lineup,home_lineup,both_confirmed
+)
 
 # =========================
-# Contexto visible del partido
+# Contexto visible
 # =========================
 st.divider()
 st.subheader("📋 Contexto del partido")
 
-ctx1, ctx2, ctx3 = st.columns([1,1,1.1])
-
+ctx1,ctx2,ctx3=st.columns([1,1,1.1])
 with ctx1:
     st.markdown(f"### ✈️ {game['away_abbr']}")
     st.write(f"**Pitcher:** {game['away_pitcher_name']}")
@@ -642,9 +809,7 @@ with ctx1:
             f"{away_pitch['hand']}HP · ERA {away_pitch['era']:.2f} · WHIP {away_pitch['whip']:.2f} · "
             f"K/9 {away_pitch['k9']:.2f} · BB/9 {away_pitch['bb9']:.2f} · HR/9 {away_pitch['hr9']:.2f}"
         )
-    else:
-        st.caption("Estadísticas del abridor: N/D")
-    st.caption(f"Ofensiva: {away_form['season_rpg']:.2f} carreras/juego · últimos 15: {away_form['recent_rpg']:.2f}")
+    st.caption(f"Ofensiva {away_form['season_rpg']:.2f} R/G · últimos 15 {away_form['recent_rpg']:.2f}")
 
 with ctx2:
     st.markdown(f"### 🏠 {game['home_abbr']}")
@@ -654,316 +819,228 @@ with ctx2:
             f"{home_pitch['hand']}HP · ERA {home_pitch['era']:.2f} · WHIP {home_pitch['whip']:.2f} · "
             f"K/9 {home_pitch['k9']:.2f} · BB/9 {home_pitch['bb9']:.2f} · HR/9 {home_pitch['hr9']:.2f}"
         )
-    else:
-        st.caption("Estadísticas del abridor: N/D")
-    st.caption(f"Ofensiva: {home_form['season_rpg']:.2f} carreras/juego · últimos 15: {home_form['recent_rpg']:.2f}")
+    st.caption(f"Ofensiva {home_form['season_rpg']:.2f} R/G · últimos 15 {home_form['recent_rpg']:.2f}")
 
 with ctx3:
     st.markdown("### 🏟️ Estadio y clima")
     st.write(f"**{(park or {}).get('name','N/D')}**")
-    st.caption(f"Park factor: {(park or {}).get('factor',1.0):.2f}")
+    st.caption(f"Park factor {(park or {}).get('factor',1.0):.2f}")
     if weather:
         st.caption(
             f"🌡️ {weather['temp_f']:.0f}°F · 💨 {weather['wind_mph']:.0f} mph · "
-            f"💧 {weather['humidity']:.0f}% humedad · 🌧️ {weather.get('precip_probability',0):.0f}% lluvia"
+            f"💧 {weather['humidity']:.0f}% · 🌧️ {weather.get('precip_probability',0):.0f}%"
         )
-    else:
-        st.caption("Clima: N/D")
-    st.caption(
-        f"Lineups: {game['away_abbr']} {'✅' if away_confirmed else '⚠️'} · "
-        f"{game['home_abbr']} {'✅' if home_confirmed else '⚠️'}"
-    )
+    else: st.caption("Clima: N/D")
+    st.caption(f"Lineups: {game['away_abbr']} {'✅' if away_confirmed else '⚠️'} · {game['home_abbr']} {'✅' if home_confirmed else '⚠️'}")
 
 st.markdown("### 👥 Lineups")
-lu1, lu2 = st.columns(2)
-
+lu1,lu2=st.columns(2)
 with lu1:
     st.write(f"**{game['away_abbr']} — {'CONFIRMADO ✅' if away_confirmed else 'PENDIENTE ⚠️'}**")
     if away_lineup:
         for p in away_lineup[:9]:
-            split_txt = "split" if p.get("used_split") else "temporada"
-            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({split_txt})")
-    else:
-        st.caption("MLB todavía no publicó el orden al bat.")
-
+            src="split" if p.get("used_split") else "temporada"
+            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
+    else: st.caption("MLB todavía no publicó el orden al bat.")
 with lu2:
     st.write(f"**{game['home_abbr']} — {'CONFIRMADO ✅' if home_confirmed else 'PENDIENTE ⚠️'}**")
     if home_lineup:
         for p in home_lineup[:9]:
-            split_txt = "split" if p.get("used_split") else "temporada"
-            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({split_txt})")
-    else:
-        st.caption("MLB todavía no publicó el orden al bat.")
+            src="split" if p.get("used_split") else "temporada"
+            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
+    else: st.caption("MLB todavía no publicó el orden al bat.")
 
 st.caption(
-    f"Última consulta visible: {datetime.now().strftime('%H:%M:%S')} · "
-    f"Calidad de datos {quality}/100 · refresco automático aproximado cada 2 minutos."
+    f"Última consulta: {datetime.now().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
+    "refresco automático aproximado cada 2 minutos."
 )
 
-btn1, btn2, spacer = st.columns([1,1,2.2])
-
-with btn1:
-    update_now = st.button("🔄 Actualizar datos", use_container_width=True, type="secondary")
-
-with btn2:
-    analyze_now = st.button("🤖 Analizar partido", use_container_width=True, type="primary")
+b1,b2,sp=st.columns([1,1,2.2])
+with b1:
+    update_now=st.button("🔄 Actualizar datos",use_container_width=True,type="secondary")
+with b2:
+    analyze_now=st.button("🧠 Analizar partido",use_container_width=True,type="primary")
 
 if update_now:
     st.cache_data.clear()
-    st.session_state["v42_analysis_ready"] = False
+    st.session_state["v5_analysis_ready"]=False
     st.rerun()
-
 if analyze_now:
-    st.session_state["v42_analysis_ready"] = True
-
+    st.session_state["v5_analysis_ready"]=True
 
 # =========================
-# Construir candidatos automáticos sin momio
+# Construcción automática
 # =========================
-automatic = []
+automatic=[]
 
-# F5 totals estándar
-for line in [3.5, 4.5, 5.5, 6.5]:
-    pr = total_probabilities(f5_total, line)
-    automatic += [
-        {
-            "category":"F5",
-            "label":f"F5 Over {line:g}",
-            "prob":pr["over"],
-            "quality":quality,
-            "confirmed":both_confirmed,
-            "volatility":"medium",
-            "reason":f"Total F5 proyectado {f5_total:.2f} vs línea {line:g}."
-        },
-        {
-            "category":"F5",
-            "label":f"F5 Under {line:g}",
-            "prob":pr["under"],
-            "quality":quality,
-            "confirmed":both_confirmed,
-            "volatility":"medium",
-            "reason":f"Total F5 proyectado {f5_total:.2f} vs línea {line:g}."
-        },
-    ]
+away_models=away_f5_debug["model_lambdas"]
+home_models=home_f5_debug["model_lambdas"]
 
-# F5 ML
-f5_ml = moneyline_probabilities(away_f5, home_f5)
-nt = f5_ml["away"] + f5_ml["home"]
-pa = f5_ml["away"]/nt if nt else .5
-ph = f5_ml["home"]/nt if nt else .5
-automatic += [
-    {
-        "category":"F5",
-        "label":f"{game['away_abbr']} F5 ML",
-        "prob":pa,
-        "quality":quality,
-        "confirmed":both_confirmed,
-        "volatility":"medium",
-        "reason":f"Proyección F5 {game['away_abbr']} {away_f5:.2f} - {game['home_abbr']} {home_f5:.2f}."
-    },
-    {
-        "category":"F5",
-        "label":f"{game['home_abbr']} F5 ML",
-        "prob":ph,
-        "quality":quality,
-        "confirmed":both_confirmed,
-        "volatility":"medium",
-        "reason":f"Proyección F5 {game['away_abbr']} {away_f5:.2f} - {game['home_abbr']} {home_f5:.2f}."
-    },
-]
+for line in [3.5,4.5,5.5,6.5]:
+    for direction,label_dir in [("over","Over"),("under","Under")]:
+        center=sim_total_prob(f5_sim,line,direction)
+        scenario=scenario_total_probs(away_models,home_models,line,direction)
+        p,lo,hi,agreement=conservative_probability(center,scenario,quality,both_confirmed,"medium")
+        automatic.append({
+            "category":"F5","label":f"F5 {label_dir} {line:g}",
+            "prob":p,"prob_low":lo,"prob_high":hi,"agreement":agreement,
+            "quality":quality,"confirmed":both_confirmed,"volatility":"medium",
+            "reason":f"Monte Carlo 24k · total F5 central {f5_total:.2f} · modelos {', '.join(f'{x+y:.2f}' for x,y in zip(away_models,home_models))}."
+        })
 
-# Full game total líneas estándar
-for line in [7.5, 8.5, 9.5, 10.5]:
-    pr = total_probabilities(fg_total, line)
-    automatic += [
-        {
-            "category":"Full Game BETA",
-            "label":f"Full Game Over {line:g}",
-            "prob":pr["over"],
-            "quality":max(35, quality-12),
-            "confirmed":False,
-            "volatility":"medium",
-            "reason":f"Total juego proyectado {fg_total:.2f} vs línea {line:g}. Bullpen aún en modo BETA."
-        },
-        {
-            "category":"Full Game BETA",
-            "label":f"Full Game Under {line:g}",
-            "prob":pr["under"],
-            "quality":max(35, quality-12),
-            "confirmed":False,
-            "volatility":"medium",
-            "reason":f"Total juego proyectado {fg_total:.2f} vs línea {line:g}. Bullpen aún en modo BETA."
-        },
-    ]
-
-# Full game ML
-fg_ml = moneyline_probabilities(away_fg, home_fg)
-nt2 = fg_ml["away"] + fg_ml["home"]
-fga = fg_ml["away"]/nt2 if nt2 else .5
-fgh = fg_ml["home"]/nt2 if nt2 else .5
-automatic += [
-    {
-        "category":"Full Game BETA",
-        "label":f"{game['away_abbr']} ML Full Game",
-        "prob":fga,
-        "quality":max(35, quality-12),
-        "confirmed":False,
-        "volatility":"medium",
-        "reason":f"Proyección juego completo {game['away_abbr']} {away_fg:.2f} - {game['home_abbr']} {home_fg:.2f}."
-    },
-    {
-        "category":"Full Game BETA",
-        "label":f"{game['home_abbr']} ML Full Game",
-        "prob":fgh,
-        "quality":max(35, quality-12),
-        "confirmed":False,
-        "volatility":"medium",
-        "reason":f"Proyección juego completo {game['away_abbr']} {away_fg:.2f} - {game['home_abbr']} {home_fg:.2f}."
-    },
-]
-
-# Props
-for p in props:
+for side,abbr in [("away",game["away_abbr"]),("home",game["home_abbr"])]:
+    center=sim_ml_prob(f5_sim,side)
+    # Approximate scenario ML by run differential logistic transformation.
+    scenario=[]
+    for a,h in zip(away_models,home_models):
+        d=(a-h) if side=="away" else (h-a)
+        scenario.append(1/(1+math.exp(-0.78*d)))
+    p,lo,hi,agreement=conservative_probability(center,scenario,quality,both_confirmed,"medium")
     automatic.append({
-        "category": p["category"],
-        "label": p["label"],
-        "prob": p["prob"],
-        "quality": p.get("data_quality", 65),
-        "confirmed": p.get("confirmed", False),
-        "volatility": "high" if p["category"]=="Home Run" else "medium",
-        "reason": p["reason"]
+        "category":"F5","label":f"{abbr} F5 ML",
+        "prob":p,"prob_low":lo,"prob_high":hi,"agreement":agreement,
+        "quality":quality,"confirmed":both_confirmed,"volatility":"medium",
+        "reason":f"Monte Carlo 24k · proyección F5 {game['away_abbr']} {away_f5:.2f} - {game['home_abbr']} {home_f5:.2f}."
     })
 
-ranked_auto = rank_automatic_candidates(automatic, max_items=5)
+for line in [7.5,8.5,9.5,10.5]:
+    for direction,label_dir in [("over","Over"),("under","Under")]:
+        center=sim_total_prob(fg_sim,line,direction)
+        # Full-game model disagreement gets a wider range because bullpen remains proxy-based.
+        pseudo=[clamp(center-.05,0,1),center,clamp(center+.05,0,1)]
+        p,lo,hi,agreement=conservative_probability(center,pseudo,max(35,quality-10),False,"medium")
+        automatic.append({
+            "category":"Full Game BETA","label":f"Full Game {label_dir} {line:g}",
+            "prob":p,"prob_low":lo,"prob_high":hi,"agreement":agreement*.88,
+            "quality":max(35,quality-10),"confirmed":False,"volatility":"medium",
+            "reason":f"Monte Carlo 24k · total completo central {fg_total:.2f} · bullpen/staff todavía proxy."
+        })
+
+for side,abbr in [("away",game["away_abbr"]),("home",game["home_abbr"])]:
+    center=sim_ml_prob(fg_sim,side)
+    pseudo=[clamp(center-.055,0,1),center,clamp(center+.055,0,1)]
+    p,lo,hi,agreement=conservative_probability(center,pseudo,max(35,quality-10),False,"medium")
+    automatic.append({
+        "category":"Full Game BETA","label":f"{abbr} ML Full Game",
+        "prob":p,"prob_low":lo,"prob_high":hi,"agreement":agreement*.88,
+        "quality":max(35,quality-10),"confirmed":False,"volatility":"medium",
+        "reason":f"Monte Carlo 24k · proyección {game['away_abbr']} {away_fg:.2f} - {game['home_abbr']} {home_fg:.2f}."
+    })
+
+automatic.extend(props)
+ranked_auto=rank_automatic_candidates_v5(automatic,max_items=5)
 
 # =========================
-# 2 pantallas
+# Pantallas
 # =========================
-tab1, tab2 = st.tabs(["1️⃣ Qué buscar", "2️⃣ Evaluar momios"])
+tab1,tab2=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios"])
 
 with tab1:
-    st.subheader(f"🤖 Qué jugaría primero en {game['away_abbr']} @ {game['home_abbr']}")
-
-    top_status = "✅ COMPLETO" if both_confirmed else "⚠️ PROVISIONAL"
-    q1,q2,q3 = st.columns([1,1,1.3])
-    q1.metric("Calidad de análisis", f"{quality}/100")
-    q2.metric("Estado", top_status)
-    q3.caption(f"🔄 Actualizado {datetime.now().strftime('%H:%M:%S')} • refresco automático ~2 min")
+    st.subheader(f"🧠 Análisis estadístico {game['away_abbr']} @ {game['home_abbr']}")
+    q1,q2,q3=st.columns([1,1,1.4])
+    q1.metric("Calidad de datos",f"{quality}/100")
+    q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
+    q3.caption("V5 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
 
     if not both_confirmed:
-        st.warning("Faltan uno o ambos lineups. Las recomendaciones se recalcularán automáticamente cuando MLB los publique.")
+        st.warning("Faltan lineups. V5 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
-    if not st.session_state.get("v42_analysis_ready", False):
-        st.info("👆 Revisa el contexto del juego y pulsa **🤖 Analizar partido** cuando quieras generar las recomendaciones.")
+    if not st.session_state.get("v5_analysis_ready",False):
+        st.info("👆 Revisa el contexto y pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
-        st.info("⚪ No encontré una opción suficientemente interesante con los datos actuales.")
+        st.info("⚪ PASS ESTADÍSTICO — No encontré suficientes opciones robustas. V5 no fuerza cinco picks.")
     else:
-        st.markdown("### 🏆 TOP oportunidades para buscar en Draftea")
-        for i, item in enumerate(ranked_auto, 1):
-            icon = "🟢" if item["auto_grade"]=="ALTA" else "🟡" if item["auto_grade"]=="MEDIA" else "⚪"
-            state = "CONFIRMADO" if item["confirmed"] else "PROVISIONAL"
+        st.markdown("### 🏆 Oportunidades más robustas")
+        for i,item in enumerate(ranked_auto,1):
+            sc=item["confidence_score"]
+            icon="🟢" if sc>=72 else "🟡" if sc>=58 else "⚪"
+            state="CONFIRMADO" if item.get("confirmed") else "PROVISIONAL"
             st.markdown(
                 f"**{i}. {icon} {item['label']}**  \n"
-                f"Modelo: **{item['prob']*100:.1f}%** · "
-                f"Cuota justa: **{prob_to_decimal(item['prob']):.2f}x** · "
-                f"🎯 Buscar **≥ {min_target_odds(item['prob']):.2f}x** · "
-                f"{state}"
+                f"Prob. central **{item['prob']*100:.1f}%** · "
+                f"Rango **{item['prob_low']*100:.1f}–{item['prob_high']*100:.1f}%** · "
+                f"Confianza **{sc}/100** · "
+                f"Acuerdo **{item.get('agreement',0)*100:.0f}%** · {state}"
             )
             st.caption(item["reason"])
 
-    with st.expander("🔬 Ver por qué recomienda esto", expanded=False):
-        a,b,c = st.columns(3)
-        a.metric(f"{game['away_abbr']} F5", f"{away_f5:.2f}")
-        b.metric(f"{game['home_abbr']} F5", f"{home_f5:.2f}")
-        c.metric("Total F5", f"{f5_total:.2f}")
+    with st.expander("🔬 Ver modelo y simulación",expanded=False):
+        a,b,c=st.columns(3)
+        a.metric(f"{game['away_abbr']} F5",f"{away_f5:.2f}")
+        b.metric(f"{game['home_abbr']} F5",f"{home_f5:.2f}")
+        c.metric("Total F5",f"{f5_total:.2f}")
+        a,b,c=st.columns(3)
+        a.metric(f"{game['away_abbr']} Full",f"{away_fg:.2f}")
+        b.metric(f"{game['home_abbr']} Full",f"{home_fg:.2f}")
+        c.metric("Total Full",f"{fg_total:.2f}")
 
-        lo, hi = central_run_range(fg_total,.20,.80)
-        a,b,c = st.columns(3)
-        a.metric(f"{game['away_abbr']} Full", f"{away_fg:.2f}")
-        b.metric(f"{game['home_abbr']} Full", f"{home_fg:.2f}")
-        c.metric("Rango total", f"{lo}–{hi}")
+        st.write("**Submodelos F5 (carreras esperadas)**")
+        st.write({
+            game["away_abbr"]:away_f5_debug["model_lambdas"],
+            game["home_abbr"]:home_f5_debug["model_lambdas"],
+            "CV simulación F5":round(f5_sim["cv"],3),
+            "CV simulación Full":round(fg_sim["cv"],3),
+        })
 
-        st.markdown("**Datos disponibles**")
+        st.write("**Qué hace V5 diferente**")
+        st.write("• Regresa muestras pequeñas hacia la media MLB.")
+        st.write("• Mezcla modelo conservador, balanceado y sensible a forma reciente.")
+        st.write("• Simula incertidumbre del parámetro de carreras, no solo resultados Poisson fijos.")
+        st.write("• Penaliza falta de lineup, mercados volátiles y desacuerdo entre modelos.")
+        st.write("• Props de hits usan aproximación binomial con tasa regresada; Ks usan mezcla gamma-Poisson.")
+
+        st.write("**Datos disponibles**")
         for note in quality_notes:
             st.write(note)
 
-        st.markdown("**Contexto**")
-        st.write(f"Parque: {(park or {}).get('name','N/D')} | factor {(park or {}).get('factor',1.0):.2f}")
-        if weather:
-            st.write(
-                f"Clima: {weather['temp_f']:.0f}°F | viento {weather['wind_mph']:.0f} mph | "
-                f"humedad {weather['humidity']:.0f}%"
-            )
-
-        st.markdown("**Lineups**")
-        c1,c2 = st.columns(2)
-        with c1:
-            st.write(f"{game['away_abbr']} {'✅' if away_confirmed else '⚠️'}")
-            for p in away_lineup[:9]:
-                st.caption(f"{p['order']}. {p['name']} | OPS {p['ops']:.3f}")
-        with c2:
-            st.write(f"{game['home_abbr']} {'✅' if home_confirmed else '⚠️'}")
-            for p in home_lineup[:9]:
-                st.caption(f"{p['order']}. {p['name']} | OPS {p['ops']:.3f}")
-
 with tab2:
-    st.subheader("💰 ¿Draftea paga suficiente?")
-    st.caption("Escoge solamente de las recomendaciones automáticas y captura el momio decimal que ves.")
+    st.subheader("💰 ¿El precio de Draftea compensa el riesgo?")
+    st.caption("Las 5 recomendaciones aparecen seleccionadas. Quita cualquiera que Draftea no tenga.")
 
-    if not st.session_state.get("v42_analysis_ready", False):
-        st.info("Primero pulsa **🤖 Analizar partido** en la parte superior.")
+    if not st.session_state.get("v5_analysis_ready",False):
+        st.info("Primero pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
-        st.info("Primero necesitamos al menos una recomendación automática.")
+        st.info("No hay recomendaciones robustas que evaluar.")
     else:
-        labels = [x["label"] for x in ranked_auto]
-        selected = st.multiselect(
-            "¿Cuáles encontraste en Draftea?",
-            labels,
-            default=labels[:min(3, len(labels))]
-        )
+        labels=[x["label"] for x in ranked_auto]
+        selected=st.multiselect("¿Cuáles encontraste en Draftea?",labels,default=labels)
 
-        evaluated = []
-        for idx, label in enumerate(selected):
-            item = next(x for x in ranked_auto if x["label"] == label)
-            c1,c2,c3 = st.columns([2.2,1,1.1])
+        evaluated=[]
+        for idx,label in enumerate(selected):
+            item=next(x for x in ranked_auto if x["label"]==label)
+            target=1.05/max(item["prob_low"],.01)
+            c1,c2,c3=st.columns([2.2,1,1])
             c1.write(f"**{label}**")
-            c2.caption(f"Necesitamos ≥ {min_target_odds(item['prob']):.2f}x")
-            odds = c3.number_input(
-                f"Momio {idx+1}",
-                min_value=1.01,
-                max_value=100.0,
-                value=1.80,
-                step=.01,
-                format="%.2f",
-                key=f"odd_v41_{idx}"
+            c2.caption(f"Cuota objetivo ≥ {target:.2f}x")
+            odds=c3.number_input(
+                f"Momio {idx+1}",1.01,100.0,1.80,.01,
+                format="%.2f",key=f"odd_v5_{idx}"
             )
-            result = evaluate_selected_candidate(item, odds)
-            evaluated.append({**item, **result, "odds":odds})
+            res=evaluate_selected_candidate_v5(item,odds)
+            evaluated.append({**item,**res,"odds":odds})
 
-        if selected:
-            evaluated = sorted(evaluated, key=lambda x: x["score"], reverse=True)
+        if evaluated:
+            evaluated=sorted(evaluated,key=lambda x:x["score"],reverse=True)
             st.markdown("### Resultado")
-            best = evaluated[0]
-
-            if best["verdict"] == "APOSTAR":
-                st.success(f"🟢 MEJOR OPCIÓN: {best['label']} @ {best['odds']:.2f}x")
-            elif best["verdict"] == "LEAN":
-                st.warning(f"🟡 MEJOR OPCIÓN: {best['label']} @ {best['odds']:.2f}x")
+            best=evaluated[0]
+            if best["verdict"]=="APOSTAR":
+                st.success(f"🟢 MEJOR PRECIO: {best['label']} @ {best['odds']:.2f}x")
+            elif best["verdict"]=="LEAN":
+                st.warning(f"🟡 MEJOR PRECIO: {best['label']} @ {best['odds']:.2f}x")
             else:
-                st.info("⚪ PASS GENERAL — Ninguno de los momios capturados compensa suficientemente el riesgo.")
+                st.info("⚪ PASS GENERAL — El precio no compensa la incertidumbre del modelo.")
 
-            for i, x in enumerate(evaluated,1):
-                icon = "🟢" if x["verdict"]=="APOSTAR" else "🟡" if x["verdict"]=="LEAN" else "⚪"
+            for i,x in enumerate(evaluated,1):
+                icon="🟢" if x["verdict"]=="APOSTAR" else "🟡" if x["verdict"]=="LEAN" else "⚪"
                 st.write(
                     f"**{i}. {icon} {x['label']} @ {x['odds']:.2f}x** — "
-                    f"Modelo {x['prob']*100:.1f}% | Cuota justa {x['fair_odds']:.2f}x | "
-                    f"EV {x['ev']*100:+.1f}% | {x['verdict']}"
+                    f"Central {x['prob']*100:.1f}% | Conservadora {x['prob_low']*100:.1f}% | "
+                    f"EV central {x['ev']*100:+.1f}% | EV conservador {x['conservative_ev']*100:+.1f}% | "
+                    f"{x['verdict']}"
                 )
-        else:
-            st.info("Selecciona al menos una recomendación que hayas encontrado en Draftea.")
 
 st.divider()
 st.caption(
-    "V4.2 experimental. El Top 5 se genera sin conocer el momio; el momio se evalúa después. "
-    "Full Game y props siguen en desarrollo y nunca deben interpretarse como garantía."
+    "V5 experimental. La probabilidad mostrada no es una garantía. "
+    "La calibración histórica/backtesting sigue siendo necesaria antes de considerar estas probabilidades validadas."
 )
