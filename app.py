@@ -508,11 +508,11 @@ def evaluate_selected_candidate(item,odds):
     }
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V4.1", page_icon="⚾", layout="wide")
-st_autorefresh(interval=120000, key="v41_refresh")
+st.set_page_config(page_title="MLB Betting Hub V4.2", page_icon="⚾", layout="wide")
+st_autorefresh(interval=120000, key="v42_refresh")
 
-st.title("⚾ MLB Betting Hub — V4.1")
-st.caption("Automático primero: te dice qué buscar. Después tú capturas el momio.")
+st.title("⚾ MLB Betting Hub — V4.2")
+st.caption("Consulta el contexto del juego, actualiza datos cuando quieras y analiza solo cuando tú lo decidas.")
 
 # =========================
 # Selección mínima
@@ -530,6 +530,12 @@ with c2:
     game_label = st.selectbox("⚾ Partido", [g["label"] for g in games])
 
 game = next(g for g in games if g["label"] == game_label)
+
+# Si cambia la fecha o el partido, pedimos un nuevo análisis.
+game_state_key = f"{selected_date.isoformat()}-{game['game_pk']}"
+if st.session_state.get("v42_game_key") != game_state_key:
+    st.session_state["v42_game_key"] = game_state_key
+    st.session_state["v42_analysis_ready"] = False
 
 # =========================
 # Datos automáticos
@@ -618,6 +624,98 @@ props = build_prop_candidates(
     home_team=game["home_abbr"],
     lineups_confirmed=both_confirmed,
 )
+
+
+# =========================
+# Contexto visible del partido
+# =========================
+st.divider()
+st.subheader("📋 Contexto del partido")
+
+ctx1, ctx2, ctx3 = st.columns([1,1,1.1])
+
+with ctx1:
+    st.markdown(f"### ✈️ {game['away_abbr']}")
+    st.write(f"**Pitcher:** {game['away_pitcher_name']}")
+    if away_pitch:
+        st.caption(
+            f"{away_pitch['hand']}HP · ERA {away_pitch['era']:.2f} · WHIP {away_pitch['whip']:.2f} · "
+            f"K/9 {away_pitch['k9']:.2f} · BB/9 {away_pitch['bb9']:.2f} · HR/9 {away_pitch['hr9']:.2f}"
+        )
+    else:
+        st.caption("Estadísticas del abridor: N/D")
+    st.caption(f"Ofensiva: {away_form['season_rpg']:.2f} carreras/juego · últimos 15: {away_form['recent_rpg']:.2f}")
+
+with ctx2:
+    st.markdown(f"### 🏠 {game['home_abbr']}")
+    st.write(f"**Pitcher:** {game['home_pitcher_name']}")
+    if home_pitch:
+        st.caption(
+            f"{home_pitch['hand']}HP · ERA {home_pitch['era']:.2f} · WHIP {home_pitch['whip']:.2f} · "
+            f"K/9 {home_pitch['k9']:.2f} · BB/9 {home_pitch['bb9']:.2f} · HR/9 {home_pitch['hr9']:.2f}"
+        )
+    else:
+        st.caption("Estadísticas del abridor: N/D")
+    st.caption(f"Ofensiva: {home_form['season_rpg']:.2f} carreras/juego · últimos 15: {home_form['recent_rpg']:.2f}")
+
+with ctx3:
+    st.markdown("### 🏟️ Estadio y clima")
+    st.write(f"**{(park or {}).get('name','N/D')}**")
+    st.caption(f"Park factor: {(park or {}).get('factor',1.0):.2f}")
+    if weather:
+        st.caption(
+            f"🌡️ {weather['temp_f']:.0f}°F · 💨 {weather['wind_mph']:.0f} mph · "
+            f"💧 {weather['humidity']:.0f}% humedad · 🌧️ {weather.get('precip_probability',0):.0f}% lluvia"
+        )
+    else:
+        st.caption("Clima: N/D")
+    st.caption(
+        f"Lineups: {game['away_abbr']} {'✅' if away_confirmed else '⚠️'} · "
+        f"{game['home_abbr']} {'✅' if home_confirmed else '⚠️'}"
+    )
+
+st.markdown("### 👥 Lineups")
+lu1, lu2 = st.columns(2)
+
+with lu1:
+    st.write(f"**{game['away_abbr']} — {'CONFIRMADO ✅' if away_confirmed else 'PENDIENTE ⚠️'}**")
+    if away_lineup:
+        for p in away_lineup[:9]:
+            split_txt = "split" if p.get("used_split") else "temporada"
+            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({split_txt})")
+    else:
+        st.caption("MLB todavía no publicó el orden al bat.")
+
+with lu2:
+    st.write(f"**{game['home_abbr']} — {'CONFIRMADO ✅' if home_confirmed else 'PENDIENTE ⚠️'}**")
+    if home_lineup:
+        for p in home_lineup[:9]:
+            split_txt = "split" if p.get("used_split") else "temporada"
+            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({split_txt})")
+    else:
+        st.caption("MLB todavía no publicó el orden al bat.")
+
+st.caption(
+    f"Última consulta visible: {datetime.now().strftime('%H:%M:%S')} · "
+    f"Calidad de datos {quality}/100 · refresco automático aproximado cada 2 minutos."
+)
+
+btn1, btn2, spacer = st.columns([1,1,2.2])
+
+with btn1:
+    update_now = st.button("🔄 Actualizar datos", use_container_width=True, type="secondary")
+
+with btn2:
+    analyze_now = st.button("🤖 Analizar partido", use_container_width=True, type="primary")
+
+if update_now:
+    st.cache_data.clear()
+    st.session_state["v42_analysis_ready"] = False
+    st.rerun()
+
+if analyze_now:
+    st.session_state["v42_analysis_ready"] = True
+
 
 # =========================
 # Construir candidatos automáticos sin momio
@@ -755,7 +853,9 @@ with tab1:
     if not both_confirmed:
         st.warning("Faltan uno o ambos lineups. Las recomendaciones se recalcularán automáticamente cuando MLB los publique.")
 
-    if not ranked_auto:
+    if not st.session_state.get("v42_analysis_ready", False):
+        st.info("👆 Revisa el contexto del juego y pulsa **🤖 Analizar partido** cuando quieras generar las recomendaciones.")
+    elif not ranked_auto:
         st.info("⚪ No encontré una opción suficientemente interesante con los datos actuales.")
     else:
         st.markdown("### 🏆 TOP oportunidades para buscar en Draftea")
@@ -810,7 +910,9 @@ with tab2:
     st.subheader("💰 ¿Draftea paga suficiente?")
     st.caption("Escoge solamente de las recomendaciones automáticas y captura el momio decimal que ves.")
 
-    if not ranked_auto:
+    if not st.session_state.get("v42_analysis_ready", False):
+        st.info("Primero pulsa **🤖 Analizar partido** en la parte superior.")
+    elif not ranked_auto:
         st.info("Primero necesitamos al menos una recomendación automática.")
     else:
         labels = [x["label"] for x in ranked_auto]
@@ -862,6 +964,6 @@ with tab2:
 
 st.divider()
 st.caption(
-    "V4.1 experimental. El Top 5 se genera sin conocer el momio; el momio se evalúa después. "
+    "V4.2 experimental. El Top 5 se genera sin conocer el momio; el momio se evalúa después. "
     "Full Game y props siguen en desarrollo y nunca deben interpretarse como garantía."
 )
