@@ -1,16 +1,29 @@
-# MLB Betting Hub V6.5.2
+# MLB Betting Hub V6.5.3 — FINAL DE PRUEBAS
 
-Mejora de interfaz para Paper Betting:
+Esta es la versión para congelar el algoritmo y comenzar el bloque formal de Paper Betting.
 
-- Sustituye `Unidades paper` por `Monto simulado de apuesta (MXN)`.
-- Muestra en pantalla:
-  - Apuesta simulada
-  - Cobro total si gana
-  - Ganancia neta si gana
-  - Pérdida simulada si falla
-- Internamente se conserva la equivalencia de unidades:
-  - 1 unidad = $50 MXN
-- El CSV guarda pesos y unidades.
-- El dashboard calcula ROI y ganancia paper en MXN.
+## Cambios sobre V6.5.2
+- No cambia el motor estadístico.
+- Corrige el estado visual:
+  - pitcher confirmado
+  - lineup rival pendiente/confirmado
+  - predicción provisional/final
+- Al congelar guarda:
+  - hora exacta CDMX
+  - timestamp ISO
+  - horas que faltaban para iniciar el juego
+  - estado de ambos lineups
+  - cantidad de bateadores disponibles por lineup
+- Paper Betting muestra:
+  - FINAL o PRELIMINAR
+  - estado de lineups al congelar
+  - hora de congelación
+  - horas antes del partido
+- Dashboard compara:
+  - FINAL vs PRELIMINAR
+  - con lineups confirmados vs con lineups pendientes
+- CSV exporta toda la trazabilidad nueva.
 
-El motor estadístico de V6.5.1 no fue modificado.
+## Regla de prueba
+No modificar algoritmo, pesos ni fórmulas durante el bloque.
+Objetivo inicial: 100–200 Paper Bets antes de una recalibración seria.
