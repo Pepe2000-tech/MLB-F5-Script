@@ -3,9 +3,8 @@ import requests
 import streamlit as st
 
 BASE = "https://statsapi.mlb.com/api/v1"
-HEADERS = {"User-Agent": "MLB-F5-Model/3.0"}
+HEADERS = {"User-Agent": "MLB-F5-Model/3.1"}
 
-# Factor >1 favorece carreras; <1 las reduce.
 STADIUMS = {
     "ARI": {"lat": 33.4455, "lon": -112.0667, "factor": 1.03, "name": "Chase Field"},
     "ATL": {"lat": 33.8907, "lon": -84.4677, "factor": 1.01, "name": "Truist Park"},
@@ -44,13 +43,9 @@ def _get(url, params=None):
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=120)
 def get_schedule(date_str):
-    params = {
-        "sportId": 1,
-        "date": date_str,
-        "hydrate": "probablePitcher,team,venue",
-    }
+    params = {"sportId": 1, "date": date_str, "hydrate": "probablePitcher,team,venue"}
     try:
         data = _get(f"{BASE}/schedule", params=params)
     except Exception:
@@ -68,13 +63,6 @@ def get_schedule(date_str):
             away_abbr = away.get("abbreviation") or away.get("teamName") or "AWAY"
             home_abbr = home.get("abbreviation") or home.get("teamName") or "HOME"
 
-            game_time_local = None
-            if g.get("gameDate"):
-                try:
-                    game_time_local = g["gameDate"]
-                except Exception:
-                    pass
-
             games.append({
                 "game_pk": g.get("gamePk"),
                 "away_id": away.get("id"),
@@ -86,7 +74,7 @@ def get_schedule(date_str):
                 "away_pitcher_name": away_pp.get("fullName", "TBD"),
                 "home_pitcher_name": home_pp.get("fullName", "TBD"),
                 "label": f"{away_abbr} @ {home_abbr}",
-                "game_time_local": game_time_local,
+                "game_time_local": g.get("gameDate"),
             })
     return games
 
@@ -95,7 +83,14 @@ def get_pitcher_stats(player_id, season):
     if not player_id:
         return None
 
+    try:
+        person = _get(f"{BASE}/people/{player_id}").get("people", [{}])[0]
+        hand = (person.get("pitchHand") or {}).get("code", "R")
+    except Exception:
+        hand = "R"
+
     params = {"stats": "season", "group": "pitching", "season": season}
+
     try:
         data = _get(f"{BASE}/people/{player_id}/stats", params=params)
         splits = data.get("stats", [{}])[0].get("splits", [])
@@ -109,13 +104,14 @@ def get_pitcher_stats(player_id, season):
         hr = float(stat.get("homeRuns", 0) or 0)
 
         return {
+            "hand": hand,
             "era": float(stat.get("era", 4.20) or 4.20),
             "whip": float(stat.get("whip", 1.28) or 1.28),
             "innings": ip,
             "games_started": int(stat.get("gamesStarted", 0) or 0),
-            "k9": (so * 9 / ip) if ip > 0 else 8.5,
-            "bb9": (bb * 9 / ip) if ip > 0 else 3.2,
-            "hr9": (hr * 9 / ip) if ip > 0 else 1.2,
+            "k9": (so*9/ip) if ip else 8.6,
+            "bb9": (bb*9/ip) if ip else 3.2,
+            "hr9": (hr*9/ip) if ip else 1.2,
         }
     except Exception:
         return None
@@ -126,12 +122,7 @@ def get_team_form(team_id, target_date):
     season_start = target.replace(month=3, day=20)
     end = target - timedelta(days=1)
 
-    fallback = {
-        "season_rpg": 4.40,
-        "recent_rpg": 4.40,
-        "games": 0,
-        "recent_games": 0,
-    }
+    fallback = {"season_rpg": 4.40, "recent_rpg": 4.40, "games": 0, "recent_games": 0}
 
     if end < season_start:
         return fallback
@@ -172,23 +163,137 @@ def get_team_form(team_id, target_date):
     if not rows:
         return fallback
 
-    season_rpg = sum(rows) / len(rows)
     recent = rows[-15:]
-    recent_rpg = sum(recent) / len(recent)
 
     return {
-        "season_rpg": season_rpg,
-        "recent_rpg": recent_rpg,
+        "season_rpg": sum(rows)/len(rows),
+        "recent_rpg": sum(recent)/len(recent),
         "games": len(rows),
         "recent_games": len(recent),
     }
 
+@st.cache_data(ttl=60)
+def get_lineups(game_pk):
+    if not game_pk:
+        return {"away": [], "home": []}
+
+    try:
+        box = _get(f"{BASE}/game/{game_pk}/boxscore")
+    except Exception:
+        return {"away": [], "home": []}
+
+    result = {}
+
+    for side in ["away", "home"]:
+        team = (box.get("teams") or {}).get(side, {})
+        players = team.get("players", {})
+        batting_order = team.get("battingOrder", []) or []
+
+        lineup = []
+        for order, player_id in enumerate(batting_order[:9], 1):
+            pdata = players.get(f"ID{player_id}", {})
+            person = pdata.get("person", {})
+            lineup.append({
+                "id": player_id,
+                "name": person.get("fullName", f"Player {player_id}"),
+                "order": order,
+            })
+
+        result[side] = lineup
+
+    return result
+
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+@st.cache_data(ttl=1800)
+def get_hitter_stats(player_id, season, opposing_hand="R"):
+    # Primero intentamos el split vs mano del pitcher. Si la API no lo
+    # devuelve o hay poca muestra, usamos temporada completa.
+    overall = None
+
+    try:
+        data = _get(
+            f"{BASE}/people/{player_id}/stats",
+            params={"stats": "season", "group": "hitting", "season": season},
+        )
+        splits = data.get("stats", [{}])[0].get("splits", [])
+        if splits:
+            s = splits[0].get("stat", {})
+            overall = {
+                "ops": _safe_float(s.get("ops"), 0.720),
+                "pa": int(s.get("plateAppearances", 0) or 0),
+            }
+    except Exception:
+        pass
+
+    sit = "vr" if opposing_hand == "R" else "vl"
+    split = None
+
+    # MLB Stats API permite situation codes con statSplits. Si falla,
+    # simplemente seguimos con temporada completa.
+    try:
+        hydrate = f"stats(group=hitting,type=statSplits,sitCodes=[{sit}],season={season})"
+        pdata = _get(
+            f"{BASE}/people",
+            params={"personIds": player_id, "hydrate": hydrate},
+        )
+        people = pdata.get("people", [])
+        if people:
+            for stat_group in people[0].get("stats", []):
+                for sp in stat_group.get("splits", []):
+                    s = sp.get("stat", {})
+                    pa = int(s.get("plateAppearances", 0) or 0)
+                    ops = _safe_float(s.get("ops"), 0.0)
+                    if ops > 0:
+                        split = {"ops": ops, "pa": pa}
+                        break
+                if split:
+                    break
+    except Exception:
+        split = None
+
+    # Evitamos confiar en splits extremadamente pequeños.
+    if split and split["pa"] >= 30:
+        return {
+            "ops": split["ops"],
+            "pa": split["pa"],
+            "used_split": True,
+            "stats_available": True,
+        }
+
+    if overall:
+        return {
+            "ops": overall["ops"],
+            "pa": overall["pa"],
+            "used_split": False,
+            "stats_available": True,
+        }
+
+    return {
+        "ops": 0.720,
+        "pa": 0,
+        "used_split": False,
+        "stats_available": False,
+    }
+
+def enrich_lineup(lineup, season, opposing_hand):
+    enriched = []
+
+    for item in lineup[:9]:
+        stats = get_hitter_stats(item["id"], season, opposing_hand)
+        enriched.append({**item, **stats})
+
+    return enriched
+
 def get_stadium_context(home_abbr):
     return STADIUMS.get(home_abbr)
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1200)
 def get_weather(lat, lon, date_str, game_time=None):
-    # Open-Meteo no requiere API key.
     try:
         params = {
             "latitude": lat,
@@ -216,9 +321,7 @@ def get_weather(lat, lon, date_str, game_time=None):
         if not temps:
             return None
 
-        # Como primera aproximación usamos la hora más cálida de la tarde si
-        # no tenemos una hora local fiable del estadio.
-        idx = min(range(len(temps)), key=lambda i: abs(i - 18))
+        idx = min(18, len(temps)-1)
 
         temp_f = float(temps[idx])
         humidity = float(hum[idx]) if idx < len(hum) else 50
