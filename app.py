@@ -1,186 +1,121 @@
 from datetime import date
 import streamlit as st
-
 from data_mlb import get_schedule, get_team_form, get_pitcher_stats
 from model import (
-    project_f5_runs,
-    total_probabilities,
-    moneyline_probabilities,
-    american_to_implied,
-    prob_to_american,
+    project_f5_runs, total_probabilities, moneyline_probabilities,
+    no_vig_probs, expected_value_decimal, prob_to_decimal
 )
 
-st.set_page_config(page_title="MLB F5 Model V2", page_icon="⚾", layout="centered")
+st.set_page_config(page_title="MLB F5 Model V2.2", page_icon="⚾", layout="centered")
+st.title("⚾ MLB F5 Model — V2.2")
+st.caption("Exclusivo Primeras 5 Entradas • Datos MLB automáticos • Mercados Draftea")
 
-st.title("⚾ MLB F5 Model — V2")
-st.caption("Cartelera automática + pitchers probables + estadísticas MLB + proyección F5 automática.")
-
-selected_date = st.date_input("📅 Fecha", value=date.today())
-
-games = get_schedule(selected_date.isoformat())
-
+day = st.date_input("📅 Fecha", value=date.today())
+games = get_schedule(day.isoformat())
 if not games:
-    st.warning("No encontré partidos MLB para esta fecha o la fuente no respondió.")
+    st.warning("No encontré juegos MLB para esta fecha.")
     st.stop()
 
-game_labels = [g["label"] for g in games]
-selected_label = st.selectbox("⚾ Selecciona un partido", game_labels)
-game = next(g for g in games if g["label"] == selected_label)
+label = st.selectbox("⚾ Partido", [g["label"] for g in games])
+g = next(x for x in games if x["label"] == label)
+
+with st.spinner("Consultando MLB..."):
+    af = get_team_form(g["away_id"], day.isoformat())
+    hf = get_team_form(g["home_id"], day.isoformat())
+    ap = get_pitcher_stats(g["away_pitcher_id"], day.year) if g["away_pitcher_id"] else None
+    hp = get_pitcher_stats(g["home_pitcher_id"], day.year) if g["home_pitcher_id"] else None
+
+c1,c2=st.columns(2)
+with c1:
+    st.subheader(f"✈️ {g['away_abbr']}")
+    st.write(g["away_pitcher_name"])
+    st.caption(f"RPG {af['season_rpg']:.2f} | L15 {af['recent_rpg']:.2f}")
+    if ap: st.caption(f"ERA {ap['era']:.2f} | WHIP {ap['whip']:.2f}")
+with c2:
+    st.subheader(f"🏠 {g['home_abbr']}")
+    st.write(g["home_pitcher_name"])
+    st.caption(f"RPG {hf['season_rpg']:.2f} | L15 {hf['recent_rpg']:.2f}")
+    if hp: st.caption(f"ERA {hp['era']:.2f} | WHIP {hp['whip']:.2f}")
+
+away_proj, _ = project_f5_runs(af, hp, bool(g["home_pitcher_id"]))
+home_proj, _ = project_f5_runs(hf, ap, bool(g["away_pitcher_id"]))
+total_proj = away_proj + home_proj
+ml = moneyline_probabilities(away_proj, home_proj)
 
 st.divider()
+st.subheader("🎰 Cuotas F5 de Draftea")
+st.caption("Escribe únicamente los mercados que quieras comparar. Cuotas en decimal.")
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown(f"### ✈️ {game['away_abbr']}")
-    st.write(f"**Pitcher:** {game['away_pitcher_name']}")
-with c2:
-    st.markdown(f"### 🏠 {game['home_abbr']}")
-    st.write(f"**Pitcher:** {game['home_pitcher_name']}")
+with st.expander("⚾ Money Line F5", expanded=True):
+    a_ml = st.number_input(f"{g['away_abbr']} ML", 1.01, 20.0, 1.82, .01, format="%.2f")
+    h_ml = st.number_input(f"{g['home_abbr']} ML", 1.01, 20.0, 2.00, .01, format="%.2f")
 
-missing_pitcher = not game["away_pitcher_id"] or not game["home_pitcher_id"]
-if missing_pitcher:
-    st.warning("⚠️ Falta confirmar al menos un pitcher abridor. La confianza del modelo se reducirá.")
+with st.expander("📊 Total F5 — Línea principal", expanded=True):
+    line1 = st.number_input("Línea principal", 2.5, 7.5, 4.5, .5)
+    o1 = st.number_input("Over línea principal", 1.01, 20.0, 1.90, .01, format="%.2f")
+    u1 = st.number_input("Under línea principal", 1.01, 20.0, 1.90, .01, format="%.2f")
 
-season = selected_date.year
+with st.expander("📊 Total F5 — Segunda línea (opcional)", expanded=False):
+    use2 = st.checkbox("Comparar segunda línea")
+    line2 = st.number_input("Segunda línea", 2.5, 8.5, 5.5, .5)
+    o2 = st.number_input("Over segunda línea", 1.01, 20.0, 2.10, .01, format="%.2f")
+    u2 = st.number_input("Under segunda línea", 1.01, 20.0, 1.74, .01, format="%.2f")
 
-with st.spinner("Consultando estadísticas MLB..."):
-    away_form = get_team_form(game["away_id"], selected_date.isoformat())
-    home_form = get_team_form(game["home_id"], selected_date.isoformat())
+if st.button("🚀 Buscar mejor apuesta F5", use_container_width=True):
+    candidates=[]
 
-    away_pitch = get_pitcher_stats(game["away_pitcher_id"], season) if game["away_pitcher_id"] else None
-    home_pitch = get_pitcher_stats(game["home_pitcher_id"], season) if game["home_pitcher_id"] else None
+    # ML is modeled as 2-way "draw no action"-style comparison by conditioning on no tie.
+    no_tie = ml["away"] + ml["home"]
+    p_a_ml = ml["away"]/no_tie if no_tie else .5
+    p_h_ml = ml["home"]/no_tie if no_tie else .5
+    nv_a,nv_h,_ = no_vig_probs(a_ml,h_ml)
+    candidates += [
+        {"market":f"{g['away_abbr']} F5 ML","p":p_a_ml,"odds":a_ml,"edge":p_a_ml-nv_a,"ev":expected_value_decimal(p_a_ml,a_ml)},
+        {"market":f"{g['home_abbr']} F5 ML","p":p_h_ml,"odds":h_ml,"edge":p_h_ml-nv_h,"ev":expected_value_decimal(p_h_ml,h_ml)}
+    ]
 
-st.subheader("📊 Datos obtenidos")
+    def add_total(line, over_odds, under_odds):
+        probs=total_probabilities(total_proj,line)
+        nv_u,nv_o,_=no_vig_probs(under_odds,over_odds)
+        candidates.extend([
+            {"market":f"F5 UNDER {line:g}","p":probs["under"],"odds":under_odds,"edge":probs["under"]-nv_u,"ev":expected_value_decimal(probs["under"],under_odds)},
+            {"market":f"F5 OVER {line:g}","p":probs["over"],"odds":over_odds,"edge":probs["over"]-nv_o,"ev":expected_value_decimal(probs["over"],over_odds)}
+        ])
+    add_total(line1,o1,u1)
+    if use2: add_total(line2,o2,u2)
 
-m1, m2 = st.columns(2)
-with m1:
-    st.write(f"**{game['away_abbr']} RPG temporada:** {away_form['season_rpg']:.2f}")
-    st.write(f"**{game['away_abbr']} RPG últimos 15:** {away_form['recent_rpg']:.2f}")
-    if away_pitch:
-        st.write(f"**{game['away_pitcher_name']} ERA:** {away_pitch['era']:.2f}")
-        st.write(f"**WHIP:** {away_pitch['whip']:.2f}")
-    else:
-        st.write("**Pitcher visitante:** sin estadísticas")
+    best=max(candidates,key=lambda x:x["ev"])
 
-with m2:
-    st.write(f"**{game['home_abbr']} RPG temporada:** {home_form['season_rpg']:.2f}")
-    st.write(f"**{game['home_abbr']} RPG últimos 15:** {home_form['recent_rpg']:.2f}")
-    if home_pitch:
-        st.write(f"**{game['home_pitcher_name']} ERA:** {home_pitch['era']:.2f}")
-        st.write(f"**WHIP:** {home_pitch['whip']:.2f}")
-    else:
-        st.write("**Pitcher local:** sin estadísticas")
+    confidence=100
+    if not g["away_pitcher_id"] or not g["home_pitcher_id"]: confidence-=25
+    if ap is None or hp is None: confidence-=15
 
-st.subheader("🎰 Sportsbook")
-s1, s2, s3 = st.columns(3)
-with s1:
-    f5_line = st.number_input("Línea F5", min_value=0.5, max_value=12.0, value=4.5, step=0.5)
-with s2:
-    under_odds = st.number_input("Momio Under", value=-110, step=5)
-with s3:
-    over_odds = st.number_input("Momio Over", value=-110, step=5)
-
-analyze = st.button("🚀 Analizar partido", use_container_width=True)
-
-if analyze:
-    away_proj, away_parts = project_f5_runs(
-        offense=away_form,
-        opposing_pitcher=home_pitch,
-        pitcher_confirmed=bool(game["home_pitcher_id"]),
-    )
-    home_proj, home_parts = project_f5_runs(
-        offense=home_form,
-        opposing_pitcher=away_pitch,
-        pitcher_confirmed=bool(game["away_pitcher_id"]),
-    )
-
-    total_proj = away_proj + home_proj
-
-    probs = total_probabilities(total_proj, f5_line)
-    ml = moneyline_probabilities(away_proj, home_proj)
-
-    implied_under = american_to_implied(under_odds)
-    implied_over = american_to_implied(over_odds)
-
-    edge_under = probs["under"] - implied_under
-    edge_over = probs["over"] - implied_over
-
-    best_side = "UNDER" if edge_under >= edge_over else "OVER"
-    best_edge = max(edge_under, edge_over)
-    best_prob = probs["under"] if best_side == "UNDER" else probs["over"]
-
-    confidence = 100
-    if missing_pitcher:
-        confidence -= 25
-    if away_form["games"] < 20 or home_form["games"] < 20:
-        confidence -= 10
-    if away_pitch is None or home_pitch is None:
-        confidence -= 15
-    confidence = max(35, min(confidence, 100))
-
-    if best_edge >= 0.08 and confidence >= 75:
-        verdict = "🔥 STRONG PLAY"
-    elif best_edge >= 0.04 and confidence >= 65:
-        verdict = "🟢 PLAY"
-    elif best_edge >= 0.015:
-        verdict = "🟡 LEAN"
-    else:
-        verdict = "⚪ PASS"
+    if best["ev"]>=.12 and best["edge"]>=.06 and confidence>=80: verdict="🔥 STRONG PLAY"
+    elif best["ev"]>=.06 and best["edge"]>=.035 and confidence>=70: verdict="🟢 PLAY"
+    elif best["ev"]>=.02 and best["edge"]>=.015 and confidence>=60: verdict="🟡 LEAN"
+    else: verdict="⚪ PASS"
 
     st.divider()
-    st.subheader(f"⏱️ F5 ANALYSIS: {game['away_abbr']} @ {game['home_abbr']}")
+    st.subheader("🤖 Proyección F5")
+    x,y,z=st.columns(3)
+    x.metric(g["away_abbr"],f"{away_proj:.2f}")
+    y.metric(g["home_abbr"],f"{home_proj:.2f}")
+    z.metric("Total",f"{total_proj:.2f}")
 
-    p1, p2, p3 = st.columns(3)
-    p1.metric(game["away_abbr"], f"{away_proj:.2f}")
-    p2.metric(game["home_abbr"], f"{home_proj:.2f}")
-    p3.metric("Total F5", f"{total_proj:.2f}")
+    st.subheader("🏆 Ranking de mercados")
+    for i,c in enumerate(sorted(candidates,key=lambda x:x["ev"],reverse=True),1):
+        st.write(f"**{i}. {c['market']} @ {c['odds']:.2f}x** — Modelo {c['p']*100:.1f}% | Edge {c['edge']*100:+.1f} pp | EV {c['ev']*100:+.1f}%")
 
-    st.markdown("### 🧠 Probabilidades")
-    st.write(f"**Under {f5_line}:** {probs['under']*100:.1f}%")
-    st.write(f"**Over {f5_line}:** {probs['over']*100:.1f}%")
-    if probs["push"] > 0:
-        st.write(f"**Push:** {probs['push']*100:.1f}%")
-
-    st.write(f"**{game['away_abbr']} gana F5:** {ml['away']*100:.1f}%")
-    st.write(f"**{game['home_abbr']} gana F5:** {ml['home']*100:.1f}%")
-    st.write(f"**Empate F5:** {ml['tie']*100:.1f}%")
-
-    st.markdown("### 🎯 Valor contra mercado")
-    st.write(
-        f"Under {f5_line}: mercado {implied_under*100:.1f}% | "
-        f"modelo {probs['under']*100:.1f}% | **edge {edge_under*100:+.1f} pp**"
-    )
-    st.write(
-        f"Over {f5_line}: mercado {implied_over*100:.1f}% | "
-        f"modelo {probs['over']*100:.1f}% | **edge {edge_over*100:+.1f} pp**"
-    )
-
-    fair = prob_to_american(best_prob)
-
-    st.markdown("### 🏁 Decisión")
-    if verdict.startswith("🔥") or verdict.startswith("🟢"):
-        st.success(f"{verdict}: F5 {best_side} {f5_line}")
+    st.subheader("🎯 Recomendación")
+    if verdict=="⚪ PASS":
+        st.info("⚪ PASS — Ninguno de los mercados capturados supera nuestros filtros.")
     elif verdict.startswith("🟡"):
-        st.warning(f"{verdict}: F5 {best_side} {f5_line}")
+        st.warning(f"{verdict}: {best['market']} @ {best['odds']:.2f}x")
     else:
-        st.info("⚪ PASS — No hay ventaja suficiente para apostar.")
-
-    st.write(f"**Fair odds del lado con mayor valor:** {fair}")
-    st.write(f"**Confianza de datos:** {confidence}/100")
-
-    with st.expander("🔬 Cómo calculó la proyección"):
-        st.write(
-            "Esta V2 mezcla ofensiva de temporada y últimos 15 juegos, "
-            "y ajusta por ERA/WHIP del pitcher rival. Después usa una "
-            "distribución Poisson para estimar probabilidades."
-        )
-        st.json({
-            game["away_abbr"]: away_parts,
-            game["home_abbr"]: home_parts,
-        })
+        st.success(f"{verdict}: {best['market']} @ {best['odds']:.2f}x")
+    st.write(f"Cuota justa estimada: **{prob_to_decimal(best['p']):.2f}x**")
+    st.write(f"Confianza de datos: **{confidence}/100**")
+    st.caption("La V2.2 compara valor; no obliga a producir una apuesta.")
 
 st.divider()
-st.caption(
-    "V2 experimental. Aún no incluye lineups confirmados, Statcast, parque, clima, "
-    "umpire ni bullpen. No garantiza resultados ni ganancias."
-)
+st.caption("Modelo experimental F5. V3 añadirá splits R/L, Statcast, lineups, parque/clima y backtesting.")

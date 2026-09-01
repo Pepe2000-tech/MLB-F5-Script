@@ -3,7 +3,7 @@ import requests
 import streamlit as st
 
 BASE = "https://statsapi.mlb.com/api/v1"
-HEADERS = {"User-Agent": "MLB-F5-Model/2.0"}
+HEADERS = {"User-Agent": "MLB-F5-Model/2.1"}
 
 def _get(url, params=None):
     r = requests.get(url, params=params, headers=HEADERS, timeout=15)
@@ -12,11 +12,7 @@ def _get(url, params=None):
 
 @st.cache_data(ttl=300)
 def get_schedule(date_str):
-    params = {
-        "sportId": 1,
-        "date": date_str,
-        "hydrate": "probablePitcher,team",
-    }
+    params = {"sportId": 1, "date": date_str, "hydrate": "probablePitcher,team"}
     try:
         data = _get(f"{BASE}/schedule", params=params)
     except Exception:
@@ -28,7 +24,6 @@ def get_schedule(date_str):
             teams = g.get("teams", {})
             away = teams.get("away", {}).get("team", {})
             home = teams.get("home", {}).get("team", {})
-
             away_pp = teams.get("away", {}).get("probablePitcher") or {}
             home_pp = teams.get("home", {}).get("probablePitcher") or {}
 
@@ -41,8 +36,6 @@ def get_schedule(date_str):
                 "home_id": home.get("id"),
                 "away_abbr": away_abbr,
                 "home_abbr": home_abbr,
-                "away_name": away.get("name", away_abbr),
-                "home_name": home.get("name", home_abbr),
                 "away_pitcher_id": away_pp.get("id"),
                 "home_pitcher_id": home_pp.get("id"),
                 "away_pitcher_name": away_pp.get("fullName", "TBD"),
@@ -55,11 +48,7 @@ def get_schedule(date_str):
 def get_pitcher_stats(player_id, season):
     if not player_id:
         return None
-    params = {
-        "stats": "season",
-        "group": "pitching",
-        "season": season,
-    }
+    params = {"stats": "season", "group": "pitching", "season": season}
     try:
         data = _get(f"{BASE}/people/{player_id}/stats", params=params)
         splits = data.get("stats", [{}])[0].get("splits", [])
@@ -81,13 +70,9 @@ def get_team_form(team_id, target_date):
     season_start = target.replace(month=3, day=20)
     end = target - timedelta(days=1)
 
+    fallback = {"season_rpg": 4.40, "recent_rpg": 4.40, "games": 0, "recent_games": 0}
     if end < season_start:
-        return {
-            "season_rpg": 4.40,
-            "recent_rpg": 4.40,
-            "games": 0,
-            "recent_games": 0,
-        }
+        return fallback
 
     params = {
         "sportId": 1,
@@ -100,21 +85,14 @@ def get_team_form(team_id, target_date):
     try:
         data = _get(f"{BASE}/schedule", params=params)
     except Exception:
-        return {
-            "season_rpg": 4.40,
-            "recent_rpg": 4.40,
-            "games": 0,
-            "recent_games": 0,
-        }
+        return fallback
 
     rows = []
     for d in data.get("dates", []):
         game_date = d.get("date")
         for g in d.get("games", []):
-            status = g.get("status", {}).get("abstractGameState")
-            if status != "Final":
+            if g.get("status", {}).get("abstractGameState") != "Final":
                 continue
-
             teams = g.get("teams", {})
             away = teams.get("away", {})
             home = teams.get("home", {})
@@ -130,12 +108,7 @@ def get_team_form(team_id, target_date):
                 rows.append((game_date, float(runs)))
 
     if not rows:
-        return {
-            "season_rpg": 4.40,
-            "recent_rpg": 4.40,
-            "games": 0,
-            "recent_games": 0,
-        }
+        return fallback
 
     season_rpg = sum(r for _, r in rows) / len(rows)
     recent = rows[-15:]
