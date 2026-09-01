@@ -1,29 +1,14 @@
-# MLB Betting Hub V6.5.3 — FINAL DE PRUEBAS
+# MLB Betting Hub V6.5.4 — FINAL DE PRUEBAS
 
-Esta es la versión para congelar el algoritmo y comenzar el bloque formal de Paper Betting.
+Esta es una actualización **bugfix** de V6.5.3. El motor estadístico permanece congelado.
 
-## Cambios sobre V6.5.2
-- No cambia el motor estadístico.
-- Corrige el estado visual:
-  - pitcher confirmado
-  - lineup rival pendiente/confirmado
-  - predicción provisional/final
-- Al congelar guarda:
-  - hora exacta CDMX
-  - timestamp ISO
-  - horas que faltaban para iniciar el juego
-  - estado de ambos lineups
-  - cantidad de bateadores disponibles por lineup
-- Paper Betting muestra:
-  - FINAL o PRELIMINAR
-  - estado de lineups al congelar
-  - hora de congelación
-  - horas antes del partido
-- Dashboard compara:
-  - FINAL vs PRELIMINAR
-  - con lineups confirmados vs con lineups pendientes
-- CSV exporta toda la trazabilidad nueva.
+## Cambio sobre V6.5.3
+- No cambia probabilidades, pesos, filtros, simulación Monte Carlo ni lógica de confianza.
+- Corrige las marcas de tiempo visibles para usar explícitamente la zona horaria de CDMX: `America/Mexico_City`.
+- `Última consulta` ahora muestra la hora real de CDMX y ya no la hora UTC del servidor de Streamlit.
+- El historial de análisis también guarda la hora en CDMX.
+- La congelación de Paper Bets sigue guardando hora CDMX e ISO con zona horaria.
+- Se actualiza la trazabilidad de nuevas Paper Bets a `model_version = V6.5.4`.
 
 ## Regla de prueba
-No modificar algoritmo, pesos ni fórmulas durante el bloque.
-Objetivo inicial: 100–200 Paper Bets antes de una recalibración seria.
+Esta versión solo corrige el bug de zona horaria. No se modificó el algoritmo de predicción.

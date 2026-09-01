@@ -12,7 +12,13 @@ from streamlit_autorefresh import st_autorefresh
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/6.5"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/6.5.4"}
+CDMX_TZ=ZoneInfo("America/Mexico_City")
+
+def now_cdmx():
+    """Return the current timezone-aware datetime in Mexico City."""
+    return datetime.now(CDMX_TZ)
+
 
 STADIUMS={
 "ARI":{"lat":33.4455,"lon":-112.0667,"factor":1.03,"name":"Chase Field"},
@@ -1233,12 +1239,12 @@ def readiness_verdict_icon(verdict):
     }.get(verdict,"⚪")
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V6.5.3", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Betting Hub V6.5.4", page_icon="⚾", layout="wide")
 st_autorefresh(interval=120000, key="v653_refresh")
 
-st.title("⚾ MLB Betting Hub — V6.5.3")
+st.title("⚾ MLB Betting Hub — V6.5.4")
 st.caption("Versión final de pruebas: algoritmo congelado + paper betting + trazabilidad + backtesting.")
-st.info("🧪 **V6.5.3 TEST BUILD** — Durante el bloque de prueba no cambies el algoritmo. Solo registra predicciones y resultados.")
+st.info("🧪 **V6.5.4 TEST BUILD** — Durante el bloque de prueba no cambies el algoritmo. Solo registra predicciones y resultados.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -1416,7 +1422,7 @@ with bp2:
     else: st.caption("Carga de bullpen: N/D")
 
 st.caption(
-    f"Última consulta: {datetime.now().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
+    f"Última consulta: {now_cdmx().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
     "refresco automático aproximado cada 2 minutos."
 )
 
@@ -1571,10 +1577,10 @@ with tab1:
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V6.5.3 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
+    q3.caption("V6.5.4 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V6.5.3 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V6.5.4 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
@@ -1629,7 +1635,7 @@ with tab1:
 
     if st.session_state.get("v653_analysis_ready",False) and ranked_auto:
         if st.button("💾 Guardar este análisis en historial",key="save_v6_analysis"):
-            stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            stamp=now_cdmx().strftime("%Y-%m-%d %H:%M:%S CDMX")
             for item in ranked_auto:
                 st.session_state["v653_history"].append({
                     "timestamp":stamp,
@@ -1817,12 +1823,12 @@ with tab2:
                 else:
                     st.session_state["v653_paper_bets"].append({
                         "paper_id":hashlib.sha1(
-                            f"{game['game_pk']}|{paper_choice['label']}|{datetime.now().isoformat()}".encode()
+                            f"{game['game_pk']}|{paper_choice['label']}|{now_cdmx().isoformat()}".encode()
                         ).hexdigest()[:10],
-                        "timestamp":datetime.now(ZoneInfo("America/Mexico_City")).strftime("%Y-%m-%d %H:%M:%S CDMX"),
-                        "freeze_time_iso":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                        "timestamp":now_cdmx().strftime("%Y-%m-%d %H:%M:%S CDMX"),
+                        "freeze_time_iso":now_cdmx().isoformat(timespec="seconds"),
                         "hours_to_game_at_freeze":round(float(ready.get("hours_to_game") or 0),2) if ready.get("hours_to_game") is not None else None,
-                        "model_version":"V6.5.3",
+                        "model_version":"V6.5.4",
                         "date":selected_date.isoformat(),
                         "game_pk":game["game_pk"],
                         "game":game["label"],
@@ -2105,6 +2111,6 @@ with tab5:
 
 st.divider()
 st.caption(
-    "V6.5.3 FINAL DE PRUEBAS. La probabilidad mostrada no es una garantía. "
+    "V6.5.4 FINAL DE PRUEBAS. La probabilidad mostrada no es una garantía. "
     "Usa primero Paper Betting y congela el algoritmo durante el bloque de prueba. Statcast avanzado todavía no está integrado."
 )
