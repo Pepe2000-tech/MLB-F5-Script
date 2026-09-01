@@ -1,42 +1,54 @@
-# MLB Betting Hub V6.1
+# MLB Betting Hub V6.5 — Pre-mercado
 
-V6.1 conserva el motor y la interfaz de V6 y agrega horario de inicio de los partidos en hora de Ciudad de México.
+Esta versión está pensada para dejar de modificar el modelo constantemente y comenzar una prueba seria.
 
 ## Nuevo
-- El selector de partido muestra: `EQUIPO @ EQUIPO — HORA CDMX`.
-- El bloque `Contexto del partido` muestra también la hora de inicio CDMX.
-- La conversión usa la zona `America/Mexico_City`, por lo que no se usa un desplazamiento fijo manual.
-- No se cambia la lógica estadística ni las recomendaciones de V6.
+- Horarios CDMX (conservado de V6.1)
+- Semáforo antes de cerrar una predicción:
+  - 🟢 LISTO PARA PAPER TEST
+  - 🟡 ESPERAR / REVISAR
+  - 🔴 NO CERRAR ANÁLISIS
+- Recomendación de cuándo volver a actualizar según tiempo al juego.
+- `Qué cambió desde tu última actualización`:
+  - abridores
+  - número de jugadores del lineup
+  - clima
+  - bullpen
+  - proyección F5 / Full Game
+- Carga de bullpen expresada como BAJA / MEDIA / ALTA.
+- Paper Betting:
+  - congela la predicción exacta
+  - momio
+  - probabilidad central / conservadora
+  - confianza
+  - acuerdo
+  - lineups confirmados o no
+  - calidad de datos
+  - versión del modelo
+- Resolución automática desde MLB para:
+  - F5 totals
+  - F5 ML
+  - Full Game totals
+  - Full Game ML
+  - Pitcher Ks
+  - Hits
+  - Total Bases
+  - Home Runs
+- Exportar e importar Paper Betting CSV.
+- Dashboard:
+  - acierto
+  - ROI paper
+  - unidades
+  - Brier Score
+  - Log Loss
+  - calibración por rangos
+  - rendimiento por categoría
 
-# MLB Betting Hub V6
+## Regla para probar V6.5
+No modificar el algoritmo después de cada pérdida.
+Congelar un bloque de predicciones y revisar el modelo cuando exista una muestra razonable.
 
-V6 conserva el flujo sencillo de V5.1 y añade una capa de análisis tipo "analista experto".
-
-## Mejoras V6
-- Contexto visible de pitchers, clima, estadio y lineups.
-- Posición defensiva en lineup cuando MLB la publica; identifica catcher.
-- Bullpen reciente con pitch counts reales de relevistas en los 3 días previos cuando StatsAPI lo permite.
-- Brazos cargados: identifica relevistas con uso elevado reciente.
-- Full Game incorpora la carga reciente del bullpen al proxy.
-- Matchup de pitcher Ks pondera K-rate de cada bateador según el orden al bat.
-- Nueva pestaña `Analista experto`:
-  - lectura principal
-  - factores a favor
-  - riesgos
-  - qué evitar
-  - consenso del sistema
-- Ranking sigue usando probabilidad central, conservadora, incertidumbre, calidad y acuerdo.
-- Historial guarda también categoría y acuerdo de modelos.
-
-## Qué NO hace V6
-- No inventa Statcast.
-- Todavía no usa xwOBA/xSLG/Barrel/Hard-Hit directamente.
-- No conoce lesiones o noticias no publicadas en MLB StatsAPI.
-- La capa "analista experto" interpreta reglas/evidencia; no es un LLM externo.
-
-## Siguiente capa recomendada
-1. Statcast fiable y cacheado.
-2. Noticias/lesiones/contexto pregame.
-3. Backtesting persistente y resultados automáticos.
-4. Calibración por mercado.
-
+## Limitaciones
+- Streamlit Community Cloud no garantiza persistencia local: exporta el CSV.
+- Statcast avanzado todavía no está integrado.
+- Full Game sigue dependiendo parcialmente de proxies de bullpen.

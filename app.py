@@ -2,6 +2,9 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import math
 import hashlib
+import csv
+import io
+import re
 import requests
 import numpy as np
 import streamlit as st
@@ -9,7 +12,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/4.1"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/6.5"}
 
 STADIUMS={
 "ARI":{"lat":33.4455,"lon":-112.0667,"factor":1.03,"name":"Chase Field"},
@@ -884,12 +887,328 @@ def format_game_time_cdmx(game_date_utc):
     except Exception:
         return "Hora N/D"
 
-# ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V6.1", page_icon="⚾", layout="wide")
-st_autorefresh(interval=120000, key="v61_refresh")
 
-st.title("⚾ MLB Betting Hub — V6.1")
-st.caption("Analista cuantitativo MLB: consenso de modelos + simulación + matchup + riesgos + contexto del juego.")
+# ================= V6.5 PRE-MARKET / PAPER TEST HELPERS =================
+def parse_game_datetime_utc(game_date_utc):
+    if not game_date_utc:
+        return None
+    try:
+        raw=str(game_date_utc).replace("Z","+00:00")
+        dt=datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(ZoneInfo("UTC"))
+    except Exception:
+        return None
+
+def workload_label(score):
+    score=float(score or 0)
+    if score >= .66:
+        return "🔴 ALTA"
+    if score >= .36:
+        return "🟡 MEDIA"
+    return "🟢 BAJA"
+
+def readiness_status(game, quality, both_confirmed, weather, away_pitch, home_pitch, away_bp_work, home_bp_work):
+    reasons=[]
+    dt=parse_game_datetime_utc(game.get("game_time_local"))
+    now=datetime.now(ZoneInfo("UTC"))
+    hours_to_game=(dt-now).total_seconds()/3600 if dt else None
+
+    if not away_pitch or not home_pitch:
+        return {
+            "level":"RED","icon":"🔴","label":"NO CERRAR ANÁLISIS",
+            "score":max(20,quality-25),
+            "reasons":["falta al menos un abridor confirmado"],
+            "hours_to_game":hours_to_game,
+            "advice":"Espera a que MLB confirme ambos abridores."
+        }
+
+    if hours_to_game is not None and hours_to_game <= 0:
+        reasons.append("el partido ya comenzó o está iniciando")
+        return {
+            "level":"RED","icon":"🔴","label":"PARTIDO INICIADO",
+            "score":quality,"reasons":reasons,"hours_to_game":hours_to_game,
+            "advice":"No congeles una nueva predicción pregame."
+        }
+
+    if not both_confirmed:
+        reasons.append("faltan lineups oficiales")
+    if weather is None:
+        reasons.append("clima no disponible")
+    if not away_bp_work.get("available") or not home_bp_work.get("available"):
+        reasons.append("carga reciente de bullpen incompleta")
+
+    if both_confirmed and weather is not None and away_bp_work.get("available") and home_bp_work.get("available") and quality >= 84:
+        level,label,icon="GREEN","LISTO PARA PAPER TEST","🟢"
+        advice="Los datos principales están completos. Puedes analizar y congelar la predicción."
+    else:
+        level,label,icon="YELLOW","ESPERAR / REVISAR","🟡"
+        if hours_to_game is None:
+            advice="Actualiza antes de cerrar la predicción."
+        elif hours_to_game > 4:
+            advice="Aún es temprano. Conviene volver a revisar 2–3 horas antes del juego."
+        elif hours_to_game > 1:
+            advice="Buena ventana para vigilar lineups y cambios de abridor."
+        else:
+            advice="Falta poco. Si continúan datos clave pendientes, no cierres una predicción de alta confianza."
+
+    ready_score=quality
+    if not both_confirmed: ready_score-=12
+    if weather is None: ready_score-=5
+    if not away_bp_work.get("available") or not home_bp_work.get("available"): ready_score-=5
+    return {
+        "level":level,"icon":icon,"label":label,"score":max(20,min(100,ready_score)),
+        "reasons":reasons,"hours_to_game":hours_to_game,"advice":advice
+    }
+
+def make_context_snapshot(game, away_pitch, home_pitch, away_lineup, home_lineup, weather,
+                          away_bp_work, home_bp_work, f5_total, fg_total):
+    return {
+        "away_pitcher":game.get("away_pitcher_name","TBD"),
+        "home_pitcher":game.get("home_pitcher_name","TBD"),
+        "away_lineup_count":len(away_lineup),
+        "home_lineup_count":len(home_lineup),
+        "temp_f":round(float(weather.get("temp_f",0)),1) if weather else None,
+        "wind_mph":round(float(weather.get("wind_mph",0)),1) if weather else None,
+        "away_bp":round(float(away_bp_work.get("fatigue_score",0)),2),
+        "home_bp":round(float(home_bp_work.get("fatigue_score",0)),2),
+        "f5_total":round(float(f5_total),2),
+        "fg_total":round(float(fg_total),2),
+    }
+
+def context_changes(previous, current):
+    if not previous:
+        return []
+    labels={
+        "away_pitcher":"Abridor visitante",
+        "home_pitcher":"Abridor local",
+        "away_lineup_count":"Jugadores lineup visitante",
+        "home_lineup_count":"Jugadores lineup local",
+        "temp_f":"Temperatura °F",
+        "wind_mph":"Viento mph",
+        "away_bp":"Carga bullpen visitante",
+        "home_bp":"Carga bullpen local",
+        "f5_total":"Proyección total F5",
+        "fg_total":"Proyección total Full Game",
+    }
+    out=[]
+    for k,label in labels.items():
+        a=previous.get(k); b=current.get(k)
+        if a != b:
+            if k in ("away_bp","home_bp") and a is not None and b is not None:
+                out.append(f"{label}: {a*100:.0f}% → {b*100:.0f}%")
+            else:
+                out.append(f"{label}: {a} → {b}")
+    return out
+
+@st.cache_data(ttl=60)
+def get_game_result_v65(game_pk):
+    """Resultado final + F5 + stats individuales desde MLB live feed."""
+    if not game_pk:
+        return {"available":False,"final":False}
+    try:
+        data=requests.get(
+            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+            headers=HEADERS,timeout=20
+        ).json()
+        status=((data.get("gameData") or {}).get("status") or {})
+        abstract=status.get("abstractGameState","")
+        detailed=status.get("detailedState","")
+        final=abstract=="Final" or status.get("statusCode")=="F"
+
+        live=data.get("liveData") or {}
+        linescore=live.get("linescore") or {}
+        teams=linescore.get("teams") or {}
+        away_runs=int(((teams.get("away") or {}).get("runs") or 0))
+        home_runs=int(((teams.get("home") or {}).get("runs") or 0))
+
+        innings=linescore.get("innings") or []
+        f5_away=f5_home=0
+        complete_f5=len(innings)>=5
+        if complete_f5:
+            for inn in innings[:5]:
+                f5_away += int((((inn.get("away") or {}).get("runs")) or 0))
+                f5_home += int((((inn.get("home") or {}).get("runs")) or 0))
+
+        player_stats={}
+        box=(live.get("boxscore") or {}).get("teams") or {}
+        for side in ("away","home"):
+            players=(box.get(side) or {}).get("players") or {}
+            for pd in players.values():
+                name=((pd.get("person") or {}).get("fullName"))
+                if not name:
+                    continue
+                batting=((pd.get("stats") or {}).get("batting") or {})
+                pitching=((pd.get("stats") or {}).get("pitching") or {})
+                player_stats[name]={
+                    "hits":int(batting.get("hits",0) or 0),
+                    "totalBases":int(batting.get("totalBases",0) or 0),
+                    "homeRuns":int(batting.get("homeRuns",0) or 0),
+                    "runs":int(batting.get("runs",0) or 0),
+                    "rbi":int(batting.get("rbi",0) or 0),
+                    "strikeOutsPitching":int(pitching.get("strikeOuts",0) or 0),
+                }
+
+        return {
+            "available":True,"final":final,"abstract":abstract,"detailed":detailed,
+            "away_runs":away_runs,"home_runs":home_runs,
+            "f5_away":f5_away,"f5_home":f5_home,"complete_f5":complete_f5,
+            "player_stats":player_stats
+        }
+    except Exception as e:
+        return {"available":False,"final":False,"error":str(e)}
+
+def compare_total(value, line, direction):
+    if value > line:
+        return "WON" if direction=="over" else "LOST"
+    if value < line:
+        return "LOST" if direction=="over" else "WON"
+    return "PUSH"
+
+def settle_market_v65(record, result):
+    if not result.get("final"):
+        return "PENDING", "Partido aún no finaliza"
+
+    market=record.get("market","")
+    away=record.get("away_abbr","")
+    home=record.get("home_abbr","")
+
+    m=re.fullmatch(r"F5 (Over|Under) ([0-9.]+)",market,re.I)
+    if m:
+        if not result.get("complete_f5"):
+            return "UNSUPPORTED","No hay 5 entradas completas"
+        direction=m.group(1).lower(); line=float(m.group(2))
+        total=result["f5_away"]+result["f5_home"]
+        return compare_total(total,line,direction),f"F5 terminó {result['f5_away']}-{result['f5_home']} (total {total})"
+
+    m=re.fullmatch(r"Full Game (Over|Under) ([0-9.]+)",market,re.I)
+    if m:
+        direction=m.group(1).lower(); line=float(m.group(2))
+        total=result["away_runs"]+result["home_runs"]
+        return compare_total(total,line,direction),f"Final {result['away_runs']}-{result['home_runs']} (total {total})"
+
+    m=re.fullmatch(r"([A-Z]{2,4}) F5 ML",market)
+    if m:
+        if not result.get("complete_f5"):
+            return "UNSUPPORTED","No hay 5 entradas completas"
+        team=m.group(1)
+        if result["f5_away"]==result["f5_home"]:
+            return "PUSH",f"F5 empatado {result['f5_away']}-{result['f5_home']}"
+        winner=away if result["f5_away"]>result["f5_home"] else home
+        return ("WON" if team==winner else "LOST"),f"F5 {away} {result['f5_away']} - {home} {result['f5_home']}"
+
+    m=re.fullmatch(r"([A-Z]{2,4}) ML Full Game",market)
+    if m:
+        team=m.group(1)
+        if result["away_runs"]==result["home_runs"]:
+            return "PUSH","Juego empatado"
+        winner=away if result["away_runs"]>result["home_runs"] else home
+        return ("WON" if team==winner else "LOST"),f"Final {away} {result['away_runs']} - {home} {result['home_runs']}"
+
+    m=re.fullmatch(r"(.+?) ([0-9]+)\+ ponches",market,re.I)
+    if m:
+        name=m.group(1); need=int(m.group(2))
+        stat=(result.get("player_stats") or {}).get(name)
+        if stat is None:
+            return "UNSUPPORTED",f"No encontré stats de {name}"
+        got=stat["strikeOutsPitching"]
+        return ("WON" if got>=need else "LOST"),f"{name}: {got} K"
+
+    m=re.fullmatch(r"(.+?) ([0-9]+)\+ hits?",market,re.I)
+    if m:
+        name=m.group(1); need=int(m.group(2))
+        stat=(result.get("player_stats") or {}).get(name)
+        if stat is None:
+            return "UNSUPPORTED",f"No encontré stats de {name}"
+        got=stat["hits"]
+        return ("WON" if got>=need else "LOST"),f"{name}: {got} hits"
+
+    m=re.fullmatch(r"(.+?) ([0-9]+)\+ bases? totales?",market,re.I)
+    if not m:
+        m=re.fullmatch(r"(.+?) ([0-9]+)\+ base total",market,re.I)
+    if m:
+        name=m.group(1); need=int(m.group(2))
+        stat=(result.get("player_stats") or {}).get(name)
+        if stat is None:
+            return "UNSUPPORTED",f"No encontré stats de {name}"
+        got=stat["totalBases"]
+        return ("WON" if got>=need else "LOST"),f"{name}: {got} TB"
+
+    m=re.fullmatch(r"(.+?) ([0-9]+)\+ HR",market,re.I)
+    if m:
+        name=m.group(1); need=int(m.group(2))
+        stat=(result.get("player_stats") or {}).get(name)
+        if stat is None:
+            return "UNSUPPORTED",f"No encontré stats de {name}"
+        got=stat["homeRuns"]
+        return ("WON" if got>=need else "LOST"),f"{name}: {got} HR"
+
+    return "UNSUPPORTED","Mercado todavía no tiene resolución automática"
+
+def normalize_paper_row(row):
+    numeric_float=["prob_central","prob_low","prob_high","agreement","odds","stake"]
+    numeric_int=["confidence","game_pk"]
+    for k in numeric_float:
+        try: row[k]=float(row.get(k,0) or 0)
+        except Exception: row[k]=0.0
+    for k in numeric_int:
+        try: row[k]=int(float(row.get(k,0) or 0))
+        except Exception: row[k]=0
+    if isinstance(row.get("confirmed"),str):
+        row["confirmed"]=row["confirmed"].lower() in ("true","1","yes","sí","si")
+    return row
+
+def paper_metrics(records):
+    settled=[r for r in records if r.get("result") in ("WON","LOST","PUSH")]
+    decided=[r for r in settled if r.get("result") in ("WON","LOST")]
+    wins=sum(r["result"]=="WON" for r in decided)
+    losses=sum(r["result"]=="LOST" for r in decided)
+    pushes=sum(r["result"]=="PUSH" for r in settled)
+
+    profit=0.0; stake_total=0.0
+    briers=[]; logloss=[]
+    eps=1e-6
+    for r in settled:
+        stake=float(r.get("stake",1) or 1)
+        odds=float(r.get("odds",0) or 0)
+        stake_total+=stake
+        if r["result"]=="WON": profit += stake*(odds-1)
+        elif r["result"]=="LOST": profit -= stake
+
+    for r in decided:
+        y=1.0 if r["result"]=="WON" else 0.0
+        p=clamp(float(r.get("prob_central",.5)),eps,1-eps)
+        briers.append((p-y)**2)
+        logloss.append(-(y*math.log(p)+(1-y)*math.log(1-p)))
+
+    return {
+        "settled":len(settled),"decided":len(decided),"wins":wins,"losses":losses,"pushes":pushes,
+        "hit_rate":wins/len(decided) if decided else None,
+        "profit":profit,"roi":profit/stake_total if stake_total else None,
+        "brier":sum(briers)/len(briers) if briers else None,
+        "logloss":sum(logloss)/len(logloss) if logloss else None,
+    }
+
+def calibration_rows(records):
+    decided=[r for r in records if r.get("result") in ("WON","LOST")]
+    buckets=[(.50,.60,"50–59%"),(.60,.70,"60–69%"),(.70,.80,"70–79%"),(.80,1.01,"80%+")]
+    rows=[]
+    for lo,hi,label in buckets:
+        group=[r for r in decided if lo<=float(r.get("prob_central",0))<hi]
+        if not group:
+            continue
+        avgp=sum(float(r["prob_central"]) for r in group)/len(group)
+        actual=sum(r["result"]=="WON" for r in group)/len(group)
+        rows.append({"Rango":label,"N":len(group),"Prob. media":f"{avgp*100:.1f}%","Acierto real":f"{actual*100:.1f}%"})
+    return rows
+
+# ================= APP UI =================
+st.set_page_config(page_title="MLB Betting Hub V6.5", page_icon="⚾", layout="wide")
+st_autorefresh(interval=120000, key="v65_refresh")
+
+st.title("⚾ MLB Betting Hub — V6.5")
+st.caption("Pre-mercado: análisis experto + semáforo de datos + paper betting + backtesting automático.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -909,9 +1228,9 @@ with c2:
 game = game_options[game_label]
 
 game_state_key=f"{selected_date.isoformat()}-{game['game_pk']}"
-if st.session_state.get("v6_game_key")!=game_state_key:
-    st.session_state["v6_game_key"]=game_state_key
-    st.session_state["v6_analysis_ready"]=False
+if st.session_state.get("v65_game_key")!=game_state_key:
+    st.session_state["v65_game_key"]=game_state_key
+    st.session_state["v65_analysis_ready"]=False
 
 with st.spinner("Consultando MLB, contexto y lineups..."):
     away_form=get_team_form(game["away_id"],selected_date.isoformat())
@@ -1049,7 +1368,7 @@ with bp1:
     if away_bp_work.get("available"):
         st.caption(
             f"Relevistas: {away_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
-            f"{away_bp_work['yesterday_pitches']} ayer · fatiga {away_bp_work['fatigue_score']*100:.0f}%"
+            f"{away_bp_work['yesterday_pitches']} ayer · carga {workload_label(away_bp_work['fatigue_score'])} ({away_bp_work['fatigue_score']*100:.0f}%)"
         )
         if away_bp_work.get("heavy_arms"):
             st.caption("Brazos cargados: "+", ".join(x["name"] for x in away_bp_work["heavy_arms"][:3]))
@@ -1060,7 +1379,7 @@ with bp2:
     if home_bp_work.get("available"):
         st.caption(
             f"Relevistas: {home_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
-            f"{home_bp_work['yesterday_pitches']} ayer · fatiga {home_bp_work['fatigue_score']*100:.0f}%"
+            f"{home_bp_work['yesterday_pitches']} ayer · carga {workload_label(home_bp_work['fatigue_score'])} ({home_bp_work['fatigue_score']*100:.0f}%)"
         )
         if home_bp_work.get("heavy_arms"):
             st.caption("Brazos cargados: "+", ".join(x["name"] for x in home_bp_work["heavy_arms"][:3]))
@@ -1071,6 +1390,33 @@ st.caption(
     "refresco automático aproximado cada 2 minutos."
 )
 
+# Semáforo pregame V6.5
+ready=readiness_status(
+    game,quality,both_confirmed,weather,away_pitch,home_pitch,away_bp_work,home_bp_work
+)
+st.markdown("### 🚦 Estado para cerrar una predicción")
+r1,r2,r3=st.columns([1,1,1.6])
+r1.metric("Semáforo",f"{ready['icon']} {ready['label']}")
+r2.metric("Preparación",f"{ready['score']}/100")
+if ready.get("hours_to_game") is not None:
+    r3.metric("Tiempo al juego",f"{max(0,ready['hours_to_game']):.1f} h")
+else:
+    r3.metric("Tiempo al juego","N/D")
+st.caption(ready["advice"])
+if ready["reasons"]:
+    st.caption("Pendiente: " + " · ".join(ready["reasons"]))
+st.caption("Statcast avanzado todavía no forma parte del semáforo; V6.5 no inventa esa capa.")
+
+current_context_snapshot=make_context_snapshot(
+    game,away_pitch,home_pitch,away_lineup,home_lineup,weather,
+    away_bp_work,home_bp_work,f5_total,fg_total
+)
+changes=context_changes(st.session_state.get("v65_previous_context"),current_context_snapshot)
+if changes:
+    with st.expander("🆕 Qué cambió desde tu última actualización",expanded=True):
+        for ch in changes:
+            st.write(f"• {ch}")
+
 b1,b2,sp=st.columns([1,1,2.2])
 with b1:
     update_now=st.button("🔄 Actualizar datos",use_container_width=True,type="secondary")
@@ -1078,11 +1424,12 @@ with b2:
     analyze_now=st.button("🧠 Analizar partido",use_container_width=True,type="primary")
 
 if update_now:
+    st.session_state["v65_previous_context"]=current_context_snapshot
     st.cache_data.clear()
-    st.session_state["v6_analysis_ready"]=False
+    st.session_state["v65_analysis_ready"]=False
     st.rerun()
 if analyze_now:
-    st.session_state["v6_analysis_ready"]=True
+    st.session_state["v65_analysis_ready"]=True
 
 # =========================
 # Construcción automática
@@ -1175,31 +1522,36 @@ def build_analysis_summary(items, selected):
 analysis_summary=build_analysis_summary(automatic,ranked_auto)
 avoid_list=build_avoid_list(automatic,{x["label"] for x in ranked_auto},max_items=4)
 
-# Historial básico en sesión
-if "v6_history" not in st.session_state:
-    st.session_state["v6_history"]=[]
+# Registros de prueba en sesión
+if "v65_history" not in st.session_state:
+    st.session_state["v65_history"]=[]
+if "v65_paper_bets" not in st.session_state:
+    st.session_state["v65_paper_bets"]=[]
 
 # =========================
 # Pantallas
 # =========================
-tab1,tab2,tab3,tab4=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios","3️⃣ Analista experto","4️⃣ Historial"])
+tab1,tab2,tab3,tab4,tab5=st.tabs([
+    "1️⃣ Qué buscar","2️⃣ Evaluar momios","3️⃣ Analista experto",
+    "4️⃣ Paper betting","5️⃣ Rendimiento"
+])
 
 with tab1:
     st.subheader(f"🧠 Análisis estadístico {game['away_abbr']} @ {game['home_abbr']}")
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V6 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
+    q3.caption("V6.5 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V6 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V6.5 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
     s2.metric("Pasaron filtros",analysis_summary["passed"])
     s3.metric("Descartados",analysis_summary["discarded"])
 
-    if not st.session_state.get("v6_analysis_ready",False):
+    if not st.session_state.get("v65_analysis_ready",False):
         st.info("👆 Revisa el contexto y pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("⚪ PASS ESTADÍSTICO — No encontré suficientes opciones robustas. V5 no fuerza cinco picks.")
@@ -1237,11 +1589,11 @@ with tab1:
                 )
                 st.caption("No calificó por: " + " · ".join(reason_parts))
 
-    if st.session_state.get("v6_analysis_ready",False) and ranked_auto:
+    if st.session_state.get("v65_analysis_ready",False) and ranked_auto:
         if st.button("💾 Guardar este análisis en historial",key="save_v6_analysis"):
             stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for item in ranked_auto:
-                st.session_state["v6_history"].append({
+                st.session_state["v65_history"].append({
                     "timestamp":stamp,
                     "date":selected_date.isoformat(),
                     "game":game["label"],
@@ -1275,7 +1627,7 @@ with tab1:
             "CV simulación Full":round(fg_sim["cv"],3),
         })
 
-        st.write("**Qué hace V6 diferente**")
+        st.write("**Qué hace V6.5 diferente**")
         st.write("• Regresa muestras pequeñas hacia la media MLB.")
         st.write("• Mezcla modelo conservador, balanceado y sensible a forma reciente.")
         st.write("• Simula incertidumbre del parámetro de carreras, no solo resultados Poisson fijos.")
@@ -1309,7 +1661,7 @@ with tab2:
     st.subheader("💰 ¿El precio de Draftea compensa el riesgo?")
     st.caption("Las 5 recomendaciones aparecen seleccionadas. Quita cualquiera que Draftea no tenga.")
 
-    if not st.session_state.get("v6_analysis_ready",False):
+    if not st.session_state.get("v65_analysis_ready",False):
         st.info("Primero pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("No hay recomendaciones robustas que evaluar.")
@@ -1326,7 +1678,7 @@ with tab2:
             c2.caption(f"Cuota objetivo ≥ {target:.2f}x")
             odds=c3.number_input(
                 f"Momio {idx+1}",1.01,100.0,1.80,.01,
-                format="%.2f",key=f"odd_v6_{idx}"
+                format="%.2f",key=f"odd_v65_{idx}"
             )
             res=evaluate_selected_candidate_v6(item,odds)
             evaluated.append({**item,**res,"odds":odds})
@@ -1351,12 +1703,62 @@ with tab2:
                     f"{x['verdict']}"
                 )
 
+            st.markdown("### 🧪 Congelar una predicción para Paper Betting")
+            st.caption("Esto guarda exactamente lo que el modelo sabía AHORA. El registro no cambia aunque después cambien lineups o probabilidades.")
+            paper_labels=[x["label"] for x in evaluated]
+            paper_market=st.selectbox("Mercado a registrar",paper_labels,key="paper_market_v65")
+            paper_choice=next(x for x in evaluated if x["label"]==paper_market)
+            pc1,pc2,pc3=st.columns(3)
+            pc1.metric("Momio",f"{paper_choice['odds']:.2f}x")
+            pc2.metric("Conservadora",f"{paper_choice['prob_low']*100:.1f}%")
+            pc3.metric("Confianza",f"{paper_choice['confidence_score']}/100")
+            stake=st.number_input("Unidades paper",min_value=.25,max_value=10.0,value=1.0,step=.25,key="paper_stake_v65")
+
+            if st.button("🧊 Congelar y registrar Paper Bet",type="primary",key="freeze_paper_v65"):
+                duplicate=any(
+                    r.get("game_pk")==game["game_pk"] and
+                    r.get("market")==paper_choice["label"] and
+                    r.get("status")=="FROZEN"
+                    for r in st.session_state["v65_paper_bets"]
+                )
+                if duplicate:
+                    st.warning("Ya tienes este mismo mercado congelado para este partido.")
+                else:
+                    st.session_state["v65_paper_bets"].append({
+                        "paper_id":hashlib.sha1(
+                            f"{game['game_pk']}|{paper_choice['label']}|{datetime.now().isoformat()}".encode()
+                        ).hexdigest()[:10],
+                        "timestamp":datetime.now(ZoneInfo("America/Mexico_City")).strftime("%Y-%m-%d %H:%M:%S CDMX"),
+                        "model_version":"V6.5",
+                        "date":selected_date.isoformat(),
+                        "game_pk":game["game_pk"],
+                        "game":game["label"],
+                        "game_time_cdmx":format_game_time_cdmx(game.get("game_time_local")),
+                        "away_abbr":game["away_abbr"],
+                        "home_abbr":game["home_abbr"],
+                        "market":paper_choice["label"],
+                        "category":paper_choice.get("category",""),
+                        "odds":round(float(paper_choice["odds"]),3),
+                        "stake":round(float(stake),2),
+                        "prob_central":round(float(paper_choice["prob"]),5),
+                        "prob_low":round(float(paper_choice.get("prob_low",paper_choice["prob"])),5),
+                        "prob_high":round(float(paper_choice.get("prob_high",paper_choice["prob"])),5),
+                        "confidence":int(paper_choice["confidence_score"]),
+                        "agreement":round(float(paper_choice.get("agreement",0)),5),
+                        "confirmed":bool(paper_choice.get("confirmed",False)),
+                        "data_quality":quality,
+                        "readiness":ready["label"],
+                        "status":"FROZEN",
+                        "result":"PENDING",
+                        "settlement_note":"",
+                    })
+                    st.success("🧊 Paper bet congelada. Ya forma parte de la prueba V6.5.")
 
 with tab3:
     st.subheader("🧠 Analista experto del partido")
     st.caption("Esta capa interpreta la salida estadística; no inventa porcentajes ni sustituye el modelo.")
 
-    if not st.session_state.get("v6_analysis_ready",False):
+    if not st.session_state.get("v65_analysis_ready",False):
         st.info("Primero pulsa **🧠 Analizar partido**.")
     else:
         if ranked_auto:
@@ -1410,44 +1812,139 @@ with tab3:
                 )
         st.caption("Statcast avanzado (xwOBA/xSLG/Barrel/Hard-Hit) queda como la siguiente integración; V6 no lo simula ni lo inventa.")
 
+
 with tab4:
-    st.subheader("📚 Historial y backtesting básico")
+    st.subheader("🧪 Paper Betting — predicciones congeladas")
     st.caption(
-        "Este historial vive en la sesión actual de Streamlit. "
-        "Descarga el CSV para conservarlo; todavía no es almacenamiento permanente."
+        "Aquí no se mueve dinero. Guarda predicción + momio + confianza y después V6.5 intenta "
+        "resolver el resultado automáticamente desde MLB."
     )
 
-    history=st.session_state.get("v6_history",[])
-    if not history:
-        st.info("Aún no has guardado análisis.")
-    else:
-        import csv, io
-        st.write(f"Registros guardados: **{len(history)}**")
-        for i,row in enumerate(history[-20:],1):
-            st.write(
-                f"**{row['game']} · {row['market']}** — "
-                f"Central {row['prob_central']*100:.1f}% | "
-                f"Conservadora {row['prob_low']*100:.1f}% | "
-                f"Confianza {row['confidence']}/100"
-            )
+    upload=st.file_uploader("Restaurar un CSV de Paper Betting",type=["csv"],key="paper_upload_v65")
+    if upload is not None and st.button("📥 Importar CSV",key="import_paper_v65"):
+        try:
+            decoded=upload.getvalue().decode("utf-8-sig")
+            imported=[normalize_paper_row(dict(r)) for r in csv.DictReader(io.StringIO(decoded))]
+            existing={r.get("paper_id") for r in st.session_state["v65_paper_bets"]}
+            added=0
+            for row in imported:
+                if row.get("paper_id") not in existing:
+                    st.session_state["v65_paper_bets"].append(row)
+                    added+=1
+            st.success(f"Importados {added} registros nuevos.")
+        except Exception as e:
+            st.error(f"No pude importar el CSV: {e}")
 
+    bets=st.session_state.get("v65_paper_bets",[])
+    if not bets:
+        st.info("Aún no hay Paper Bets. Ve a **Evaluar momios** y congela una predicción.")
+    else:
+        if st.button("🔄 Actualizar resultados desde MLB",type="primary",key="settle_paper_v65"):
+            st.cache_data.clear()
+            updated=0
+            for rec in st.session_state["v65_paper_bets"]:
+                if rec.get("result") in ("WON","LOST","PUSH"):
+                    continue
+                gr=get_game_result_v65(rec.get("game_pk"))
+                if gr.get("final"):
+                    verdict,note=settle_market_v65(rec,gr)
+                    rec["result"]=verdict
+                    rec["settlement_note"]=note
+                    if verdict in ("WON","LOST","PUSH"):
+                        rec["status"]="SETTLED"
+                    updated+=1
+            st.success(f"Revisé los registros. {updated} tuvieron partido final disponible.")
+
+        st.write(f"Paper Bets registradas: **{len(bets)}**")
+        for rec in reversed(bets[-30:]):
+            icon={"WON":"✅","LOST":"❌","PUSH":"↩️","PENDING":"⏳","UNSUPPORTED":"⚠️"}.get(rec.get("result"),"⏳")
+            st.write(
+                f"**{icon} {rec.get('game')} · {rec.get('market')} @ {float(rec.get('odds',0)):.2f}x** — "
+                f"{rec.get('game_time_cdmx','')} | conservadora {float(rec.get('prob_low',0))*100:.1f}% | "
+                f"confianza {rec.get('confidence',0)}/100 | {rec.get('result','PENDING')}"
+            )
+            if rec.get("settlement_note"):
+                st.caption(rec["settlement_note"])
+
+        fields=[
+            "paper_id","timestamp","model_version","date","game_pk","game","game_time_cdmx",
+            "away_abbr","home_abbr","market","category","odds","stake",
+            "prob_central","prob_low","prob_high","confidence","agreement","confirmed",
+            "data_quality","readiness","status","result","settlement_note"
+        ]
         output=io.StringIO()
-        writer=csv.DictWriter(output,fieldnames=list(history[0].keys()))
+        writer=csv.DictWriter(output,fieldnames=fields,extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(history)
+        writer.writerows(bets)
         st.download_button(
-            "⬇️ Descargar historial CSV",
+            "⬇️ Descargar Paper Betting CSV",
             data=output.getvalue().encode("utf-8"),
-            file_name=f"mlb_v6_historial_{selected_date.isoformat()}.csv",
+            file_name=f"mlb_v65_paper_betting_{date.today().isoformat()}.csv",
             mime="text/csv"
         )
 
-        if st.button("🗑️ Limpiar historial de esta sesión",key="clear_v6_history"):
-            st.session_state["v6_history"]=[]
+        if st.button("🗑️ Limpiar Paper Betting de esta sesión",key="clear_paper_v65"):
+            st.session_state["v65_paper_bets"]=[]
             st.rerun()
+
+with tab5:
+    st.subheader("📊 Rendimiento y calibración")
+    bets=st.session_state.get("v65_paper_bets",[])
+    metrics=paper_metrics(bets)
+
+    if metrics["decided"]==0:
+        st.info("Todavía no hay suficientes Paper Bets resueltas para evaluar el modelo.")
+        st.caption("El objetivo inicial es acumular un bloque sin cambiar el algoritmo, idealmente 100–200 predicciones.")
+    else:
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("Resueltas",metrics["settled"])
+        m2.metric("Acierto",f"{metrics['hit_rate']*100:.1f}%" if metrics["hit_rate"] is not None else "N/D")
+        m3.metric("ROI paper",f"{metrics['roi']*100:+.1f}%" if metrics["roi"] is not None else "N/D")
+        m4.metric("Unidades",f"{metrics['profit']:+.2f}")
+
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("Ganadas",metrics["wins"])
+        m2.metric("Perdidas",metrics["losses"])
+        m3.metric("Push",metrics["pushes"])
+        m4.metric("Brier Score",f"{metrics['brier']:.3f}" if metrics["brier"] is not None else "N/D")
+
+        st.caption("Brier Score: menor es mejor. 0 sería predicción perfecta; por sí solo no basta, debe verse junto con calibración y tamaño de muestra.")
+        if metrics["logloss"] is not None:
+            st.caption(f"Log Loss actual: {metrics['logloss']:.3f}")
+
+        st.markdown("### 🎯 Calibración")
+        cal=calibration_rows(bets)
+        if cal:
+            st.table(cal)
+        else:
+            st.caption("Faltan registros en distintos rangos de probabilidad.")
+
+        st.markdown("### 🧩 Rendimiento por mercado")
+        decided=[r for r in bets if r.get("result") in ("WON","LOST")]
+        cats=sorted({r.get("category","Sin categoría") or "Sin categoría" for r in decided})
+        rows=[]
+        for cat in cats:
+            group=[r for r in decided if (r.get("category","") or "Sin categoría")==cat]
+            wins=sum(r["result"]=="WON" for r in group)
+            rows.append({
+                "Mercado":cat,
+                "N":len(group),
+                "Acierto":f"{wins/len(group)*100:.1f}%" if group else "N/D",
+                "Conf. media":f"{sum(float(r.get('confidence',0)) for r in group)/len(group):.0f}/100" if group else "N/D"
+            })
+        if rows:
+            st.table(rows)
+
+        if metrics["decided"] < 30:
+            st.warning("⚠️ Muestra todavía muy pequeña. No cambies pesos del modelo por estos primeros resultados.")
+        elif metrics["decided"] < 100:
+            st.warning("🟡 Ya hay información, pero todavía conviene completar al menos ~100 predicciones antes de recalibrar.")
+        else:
+            st.success("🟢 Ya existe una muestra útil para empezar una revisión formal de calibración por mercado.")
+
 
 st.divider()
 st.caption(
-    "V6 experimental. La probabilidad mostrada no es una garantía. "
-    "La calibración histórica/backtesting sigue siendo necesaria. Statcast avanzado todavía no está integrado en esta versión."
+    "V6.5 pre-mercado. La probabilidad mostrada no es una garantía. "
+    "Usa primero Paper Betting y congela el algoritmo durante el bloque de prueba. Statcast avanzado todavía no está integrado."
 )
