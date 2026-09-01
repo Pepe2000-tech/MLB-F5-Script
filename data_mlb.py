@@ -3,7 +3,7 @@ import requests
 import streamlit as st
 
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/4.0"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/4.1"}
 
 STADIUMS={
 "ARI":{"lat":33.4455,"lon":-112.0667,"factor":1.03,"name":"Chase Field"},
@@ -117,7 +117,6 @@ def get_team_form(team_id,target_date):
 
 @st.cache_data(ttl=1800)
 def get_team_pitching_profile(team_id,season,target_date):
-    # Proxy de bullpen/staff: estadísticas de pitcheo del equipo + carreras permitidas recientes.
     try:
         data=_get(f"{BASE}/teams/{team_id}/stats",{"stats":"season","group":"pitching","season":season})
         splits=data.get("stats",[{}])[0].get("splits",[])

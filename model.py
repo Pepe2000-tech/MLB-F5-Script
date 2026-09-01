@@ -5,9 +5,6 @@ LEAGUE_K9=8.60; LEAGUE_BB9=3.20; LEAGUE_HR9=1.20; LEAGUE_OPS=.720
 BASE_F5=LEAGUE_RPG*(5/9); BASE_REST=LEAGUE_RPG*(4/9)
 
 def clamp(x,lo,hi):return max(lo,min(hi,x))
-def no_vig_probs(a,b):
-    ia,ib=1/a,1/b;t=ia+ib
-    return ia/t,ib/t,t-1
 def expected_value_decimal(p,odds):return p*odds-1
 def prob_to_decimal(p):return 1/p if p>0 else float("inf")
 def min_target_odds(p,target_ev=.05):return (1+target_ev)/p if p>0 else float("inf")
@@ -75,9 +72,7 @@ def project_full_game_runs_v4(away_f5,home_f5,away_form,home_form,away_staff,hom
     return away,home,{
         "away_f5":round(away_f5,3),"home_f5":round(home_f5,3),
         "away_remaining_innings":round(away_rest,3),"home_remaining_innings":round(home_rest,3),
-        "home_staff_factor":round(home_bp,3),"away_staff_factor":round(away_bp,3),
-        "park_factor":round(park,3),"weather_factor":round(wf,3),
-        "away_full":round(away,3),"home_full":round(home,3)
+        "home_staff_factor":round(home_bp,3),"away_staff_factor":round(away_bp,3)
     }
 
 def total_probabilities(lam,line):
@@ -116,30 +111,16 @@ def central_run_range(lam,low=.20,high=.80):
             hi=k;break
     return lo,hi
 
-def grade_market(ev,edge,dq,confirmed,allow_strong=True):
-    if dq<55:return "PASS","Baja"
-    if not confirmed:
-        if ev>=.07 and edge>=.04 and dq>=68:return "PLAY","Provisional"
-        if ev>=.025 and edge>=.015 and dq>=58:return "LEAN","Provisional"
-        return "PASS","Provisional"
-    if allow_strong and ev>=.14 and edge>=.07 and dq>=85:return "STRONG","Alta"
-    if ev>=.07 and edge>=.04 and dq>=72:return "PLAY","Media-Alta"
-    if ev>=.025 and edge>=.015 and dq>=62:return "LEAN","Media"
-    return "PASS","Baja"
-
 def poisson_tail(lam,threshold):
     if threshold<=0:return 1.0
     return 1-sum(poisson_pmf(k,lam) for k in range(threshold))
 
-def poisson_under(lam,max_count):
-    return sum(poisson_pmf(k,lam) for k in range(max_count+1))
+def expected_pa(order):
+    return {1:4.55,2:4.50,3:4.45,4:4.35,5:4.25,6:4.10,7:4.00,8:3.90,9:3.80}.get(order,4.10)
 
 def prob_at_least_one(rate,pa):
     rate=clamp(rate,0,.95)
     return 1-(1-rate)**pa
-
-def expected_pa(order):
-    return {1:4.55,2:4.50,3:4.45,4:4.35,5:4.25,6:4.10,7:4.00,8:3.90,9:3.80}.get(order,4.10)
 
 def build_prop_candidates(away_pitcher,home_pitcher,away_pitcher_name,home_pitcher_name,
                           away_lineup,home_lineup,away_team,home_team,lineups_confirmed=False):
@@ -154,89 +135,133 @@ def build_prop_candidates(away_pitcher,home_pitcher,away_pitcher_name,home_pitch
             if vals:opp_k=sum(vals)/len(vals)
             k_adj=clamp(opp_k/.22,.85,1.18)
             mean_k=p["k9"]*p.get("expected_ip",5.2)/9*k_adj
-            for th in [4,5,6,7]:
+            for th in [4,5,6]:
                 prob=poisson_tail(mean_k,th)
                 props.append({
-                    "category":"Pitcher Ks","label":f"{name} {th}+ ponches","prob":prob,
-                    "safety":round(clamp(prob*100+(8 if th<=5 else 0),30,92)),
-                    "reason":f"Media proyectada ~{mean_k:.1f} K; K-rate rival ajustado.",
-                    "confirmed":True,"data_quality":78
+                    "category":"Pitcher Ks",
+                    "label":f"{name} {th}+ ponches",
+                    "prob":prob,
+                    "reason":f"Media proyectada ~{mean_k:.1f} K; ajustada por K-rate rival.",
+                    "confirmed":True,
+                    "data_quality":78
                 })
-            # O/U 4.5 y 5.5
-            for line in [4.5,5.5]:
-                over_th=int(math.floor(line))+1
-                p_over=poisson_tail(mean_k,over_th)
-                p_under=1-p_over
-                props += [
-                    {"category":"Pitcher Ks O/U","label":f"{name} Over {line} K","prob":p_over,
-                     "safety":round(clamp(p_over*100,30,88)),"reason":f"Media proyectada ~{mean_k:.1f} K.",
-                     "confirmed":True,"data_quality":78},
-                    {"category":"Pitcher Ks O/U","label":f"{name} Under {line} K","prob":p_under,
-                     "safety":round(clamp(p_under*100,30,88)),"reason":f"Media proyectada ~{mean_k:.1f} K.",
-                     "confirmed":True,"data_quality":78},
-                ]
 
     def add_hitters(lineup):
         for p in lineup[:9]:
-            if not p.get("stats_available"):continue
+            if not p.get("stats_available"): continue
             pa=expected_pa(p["order"])
             confirmed=lineups_confirmed
-            dq=82 if confirmed else 62
+            dq=82 if confirmed else 60
 
             mean_hits=p["hit_rate"]*pa
-            for th in [1,2]:
-                prob=poisson_tail(mean_hits,th)
-                props.append({"category":"Hits","label":f"{p['name']} {th}+ hit{'s' if th>1 else ''}",
-                              "prob":prob,"safety":round(clamp(prob*100,25,95)),
-                              "reason":f"Media hits ~{mean_hits:.2f}; ~{pa:.1f} PA esperadas desde turno #{p['order']}.",
-                              "confirmed":confirmed,"data_quality":dq})
-            # Hits O/U 1.5
-            p_over=poisson_tail(mean_hits,2)
+            p1=poisson_tail(mean_hits,1)
+            p2=poisson_tail(mean_hits,2)
             props += [
-                {"category":"Hits","label":f"{p['name']} Over 1.5 hits","prob":p_over,
-                 "safety":round(clamp(p_over*100,20,85)),"reason":f"Media hits ~{mean_hits:.2f}.",
+                {"category":"Hits","label":f"{p['name']} 1+ hit","prob":p1,
+                 "reason":f"~{pa:.1f} PA desde turno #{p['order']}; media hits ~{mean_hits:.2f}.",
                  "confirmed":confirmed,"data_quality":dq},
-                {"category":"Hits","label":f"{p['name']} Under 1.5 hits","prob":1-p_over,
-                 "safety":round(clamp((1-p_over)*100,30,92)),"reason":f"Media hits ~{mean_hits:.2f}.",
+                {"category":"Hits","label":f"{p['name']} 2+ hits","prob":p2,
+                 "reason":f"~{pa:.1f} PA desde turno #{p['order']}; media hits ~{mean_hits:.2f}.",
                  "confirmed":confirmed,"data_quality":dq},
             ]
 
             mean_tb=p["tb_rate"]*pa
-            for th in [1,2,3]:
-                prob=poisson_tail(mean_tb,th)
-                props.append({"category":"Total Bases","label":f"{p['name']} {th}+ bases totales",
-                              "prob":prob,"safety":round(clamp(prob*100,20,95)),
-                              "reason":f"Media TB ~{mean_tb:.2f}; posición #{p['order']}.",
-                              "confirmed":confirmed,"data_quality":dq})
-            p_tb_over=poisson_tail(mean_tb,2)
+            ptb1=poisson_tail(mean_tb,1)
+            ptb2=poisson_tail(mean_tb,2)
             props += [
-                {"category":"Total Bases","label":f"{p['name']} Over 1.5 bases totales","prob":p_tb_over,
-                 "safety":round(clamp(p_tb_over*100,20,88)),"reason":f"Media TB ~{mean_tb:.2f}.",
+                {"category":"Total Bases","label":f"{p['name']} 1+ base total","prob":ptb1,
+                 "reason":f"Media TB ~{mean_tb:.2f}; turno #{p['order']}.",
                  "confirmed":confirmed,"data_quality":dq},
-                {"category":"Total Bases","label":f"{p['name']} Under 1.5 bases totales","prob":1-p_tb_over,
-                 "safety":round(clamp((1-p_tb_over)*100,25,90)),"reason":f"Media TB ~{mean_tb:.2f}.",
+                {"category":"Total Bases","label":f"{p['name']} 2+ bases totales","prob":ptb2,
+                 "reason":f"Media TB ~{mean_tb:.2f}; turno #{p['order']}.",
                  "confirmed":confirmed,"data_quality":dq},
             ]
 
             mean_hrr=p["hrr_rate"]*pa
-            for th in [2,3]:
-                prob=poisson_tail(mean_hrr,th)
-                props.append({"category":"HRR","label":f"{p['name']} {th}+ HRR","prob":prob,
-                              "safety":round(clamp(prob*100,20,88)),
-                              "reason":f"Media aproximada H+R+RBI ~{mean_hrr:.2f}.",
-                              "confirmed":confirmed,"data_quality":dq})
+            phrr=poisson_tail(mean_hrr,2)
+            props.append({"category":"HRR","label":f"{p['name']} 2+ HRR","prob":phrr,
+                          "reason":f"Media H+R+RBI ~{mean_hrr:.2f}.",
+                          "confirmed":confirmed,"data_quality":dq})
 
-            hrp=prob_at_least_one(p["hr_rate"],pa)
-            props.append({"category":"Home Run","label":f"{p['name']} 1+ HR","prob":hrp,
-                          "safety":round(clamp(hrp*100,10,70)),
-                          "reason":f"Mercado volátil; HR/PA con ~{pa:.1f} PA esperadas.",
+            phr=prob_at_least_one(p["hr_rate"],pa)
+            props.append({"category":"Home Run","label":f"{p['name']} 1+ HR","prob":phr,
+                          "reason":f"Mercado de alta varianza; ~{pa:.1f} PA esperadas.",
                           "confirmed":confirmed,"data_quality":max(50,dq-10)})
 
-    add_hitters(away_lineup);add_hitters(home_lineup)
+    add_hitters(away_lineup)
+    add_hitters(home_lineup)
     return props
 
-def evaluate_prop_odds(prop,odds):
-    p=prop["prob"];ev=p*odds-1;fair=prob_to_decimal(p)
-    implied=1/odds;edge=p-implied
-    verdict,conf=grade_market(ev,edge,prop.get("data_quality",65),prop.get("confirmed",False),allow_strong=False)
-    return {"ev":ev,"fair_odds":fair,"edge":edge,"verdict":verdict,"confidence":conf}
+def _auto_score(item):
+    p=item["prob"]
+    q=item.get("quality",65)/100
+    confirmed=item.get("confirmed",False)
+    volatility=item.get("volatility","medium")
+
+    # Queremos "qué buscar" antes de conocer el momio:
+    # priorizamos probabilidad + calidad + estabilidad, no EV.
+    prob_component = clamp((p-.48)/.32, 0, 1)
+    conf_component = q
+    confirmed_bonus = .06 if confirmed else 0
+    volatility_penalty = .10 if volatility=="high" else .03 if volatility=="medium" else 0
+    beta_penalty = .08 if "BETA" in item.get("category","") else 0
+    return prob_component*.62 + conf_component*.32 + confirmed_bonus - volatility_penalty - beta_penalty
+
+def rank_automatic_candidates(items,max_items=5):
+    ranked=[]
+    for item in items:
+        if item["prob"] < .54:
+            continue
+        x=dict(item)
+        x["auto_score"]=_auto_score(x)
+        if x["auto_score"]>=.62:
+            x["auto_grade"]="ALTA"
+        elif x["auto_score"]>=.48:
+            x["auto_grade"]="MEDIA"
+        else:
+            x["auto_grade"]="BAJA"
+        ranked.append(x)
+
+    ranked=sorted(ranked,key=lambda x:(x["auto_score"],x["prob"]),reverse=True)
+
+    # Diversidad: no queremos 5 props casi iguales del mismo pitcher/jugador.
+    selected=[]
+    seen_prefix={}
+    for item in ranked:
+        prefix=item["label"].split(" 1+")[0].split(" 2+")[0].split(" 3+")[0].split(" 4+")[0].split(" 5+")[0].split(" 6+")[0]
+        count=seen_prefix.get(prefix,0)
+        if count>=2:
+            continue
+        selected.append(item)
+        seen_prefix[prefix]=count+1
+        if len(selected)>=max_items:
+            break
+    return selected
+
+def evaluate_selected_candidate(item,odds):
+    p=item["prob"]
+    ev=expected_value_decimal(p,odds)
+    fair=prob_to_decimal(p)
+    target=min_target_odds(p)
+    edge_price = odds/target - 1
+
+    if ev>=.08 and odds>=target:
+        verdict="APOSTAR"
+    elif ev>=.03 and odds>=fair:
+        verdict="LEAN"
+    else:
+        verdict="PASS"
+
+    quality=item.get("quality",65)/100
+    score=ev*quality
+    if not item.get("confirmed",False):
+        score*=.88
+
+    return {
+        "ev":ev,
+        "fair_odds":fair,
+        "target_odds":target,
+        "edge_price":edge_price,
+        "verdict":verdict,
+        "score":score
+    }

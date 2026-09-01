@@ -1,58 +1,49 @@
-# MLB Betting Hub — V4
+# MLB Betting Hub V4.1
 
-V4 convierte el proyecto en un comparador de oportunidades por partido.
+Objetivo:
+1. Escoger fecha y partido.
+2. La app analiza automáticamente F5, juego completo y player props.
+3. Sin conocer momios, genera hasta 5 opciones que conviene buscar en Draftea.
+4. En la segunda pantalla el usuario selecciona cuáles encontró y captura el momio.
+5. La app evalúa si el precio realmente vale la pena.
 
-## Pestaña principal: Mejor apuesta
-Compara solamente mercados que el usuario haya capturado con cuota:
-- F5 ML
-- hasta 3 totales F5
-- Full Game ML
-- Full Game total
-- hasta 3 player props
+## Pantalla 1 — Qué buscar
+No pide momios.
 
-Devuelve:
-- ranking general
-- probabilidad del modelo
-- EV
-- cuota justa
-- cuota mínima objetivo
-- PASS / LEAN / PLAY / STRONG
-
-## F5
-Mantiene el motor más desarrollado:
+Analiza automáticamente:
 - abridores
-- ofensiva
-- lineups
+- ERA, WHIP, K/9, BB/9, HR/9
+- ofensiva temporada y últimos 15
 - parque
 - clima
+- lineups oficiales cuando MLB los publica
+- OPS y posición de los 9 bateadores
+- F5
+- juego completo con bullpen/staff proxy
+- props de pitcher y bateadores
 
-## Full Game
-Ahora separa claramente:
-- proyección del modelo
-- línea de Draftea
-- diferencia
-- rango central de carreras
+Entrega:
+- Top 5
+- probabilidad del modelo
+- cuota justa
+- cuota mínima objetivo
+- estado confirmado/provisional
+- explicación breve
 
-Añade bullpen/staff proxy:
-- ERA del staff
-- WHIP del staff
-- carreras permitidas por juego en últimos 10
+## Pantalla 2 — Evaluar momios
+El usuario selecciona solamente entre el Top automático y captura las cuotas reales de Draftea.
 
-Sigue siendo BETA y no puede marcar STRONG.
+La app devuelve:
+- probabilidad
+- cuota justa
+- cuota mínima objetivo
+- EV
+- APOSTAR / LEAN / PASS
+- mejor opción entre las seleccionadas
 
-## Props
-Genera:
-- Pitcher Ks milestones
-- Pitcher Ks Over/Under
-- Hits milestones y O/U
-- Total Bases milestones y O/U
-- HRR
-- Home Run
+## Importante
+El ranking sin momio NO significa que todas sean apuestas.
+La Pantalla 1 dice qué mercados buscar.
+La Pantalla 2 decide si el precio es suficientemente bueno.
 
-Muestra cuota justa y cuota mínima objetivo (~5% EV).
-Props de bateadores quedan provisionales sin lineup oficial.
-
-## Próxima etapa recomendada
-- Statcast (xwOBA, Barrel%, Hard-Hit%, xERA)
-- bullpen real por relevistas disponibles
-- backtesting y calibración histórica
+Full Game y Player Props siguen siendo módulos experimentales.
