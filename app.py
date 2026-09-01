@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import math
 import hashlib
 import requests
@@ -162,6 +163,76 @@ def get_team_pitching_profile(team_id,season,target_date):
         "fatigue_index":fatigue_index
     }
 
+@st.cache_data(ttl=600)
+def get_bullpen_workload(team_id,target_date):
+    """Carga real reciente aproximada a partir de pitch counts de relevistas en boxscores MLB.
+    No predice disponibilidad médica; mide uso observable en los 3 días previos.
+    """
+    target=datetime.strptime(target_date,"%Y-%m-%d").date()
+    start=target-timedelta(days=3)
+    total_pitches=0
+    yesterday_pitches=0
+    reliever_appearances=0
+    heavy_arms=[]
+    by_pitcher={}
+    games_checked=0
+    try:
+        sched=_get(f"{BASE}/schedule",{
+            "sportId":1,"teamId":team_id,"startDate":start.isoformat(),
+            "endDate":(target-timedelta(days=1)).isoformat(),"gameType":"R"
+        })
+        game_rows=[]
+        for d in sched.get("dates",[]):
+            for g in d.get("games",[]):
+                if g.get("status",{}).get("abstractGameState")!="Final": continue
+                game_rows.append((d.get("date"),g.get("gamePk")))
+        for dstr,gpk in game_rows[-3:]:
+            if not gpk: continue
+            try: box=_get(f"{BASE}/game/{gpk}/boxscore")
+            except Exception: continue
+            games_checked+=1
+            side=None
+            for s in ["away","home"]:
+                tm=(box.get("teams") or {}).get(s,{})
+                if (tm.get("team") or {}).get("id")==team_id:
+                    side=s;break
+            if side is None: continue
+            tm=(box.get("teams") or {}).get(side,{})
+            players=tm.get("players",{})
+            for pid in tm.get("pitchers",[]) or []:
+                pd=players.get(f"ID{pid}",{})
+                pstat=((pd.get("stats") or {}).get("pitching") or {})
+                if not pstat: continue
+                gs=int(pstat.get("gamesStarted",0) or 0)
+                if gs>0: continue
+                pitches=int(pstat.get("pitchesThrown",0) or 0)
+                if pitches<=0: continue
+                name=(pd.get("person") or {}).get("fullName",str(pid))
+                total_pitches+=pitches
+                reliever_appearances+=1
+                rec=by_pitcher.setdefault(name,{"pitches":0,"days":0,"yesterday":0})
+                rec["pitches"]+=pitches;rec["days"]+=1
+                if dstr==(target-timedelta(days=1)).isoformat():
+                    yesterday_pitches+=pitches;rec["yesterday"]+=pitches
+        for name,rec in by_pitcher.items():
+            if rec["yesterday"]>=22 or rec["pitches"]>=38 or rec["days"]>=2:
+                heavy_arms.append({"name":name,**rec})
+    except Exception:
+        return {"available":False,"games_checked":0,"total_pitches_3d":0,"yesterday_pitches":0,
+                "reliever_appearances":0,"heavy_arms":[],"fatigue_score":.35}
+
+    fatigue=0.0
+    fatigue += min(total_pitches/180,.55)
+    fatigue += min(yesterday_pitches/90,.25)
+    fatigue += min(len(heavy_arms)*.07,.20)
+    fatigue=clamp_local(fatigue,0,1)
+    return {
+        "available":games_checked>0,"games_checked":games_checked,
+        "total_pitches_3d":total_pitches,"yesterday_pitches":yesterday_pitches,
+        "reliever_appearances":reliever_appearances,"heavy_arms":heavy_arms,
+        "fatigue_score":fatigue
+    }
+
 @st.cache_data(ttl=60)
 def get_lineups(game_pk):
     if not game_pk:return {"away":[],"home":[]}
@@ -174,7 +245,8 @@ def get_lineups(game_pk):
         lineup=[]
         for idx,pid in enumerate(order[:9],1):
             pd=players.get(f"ID{pid}",{});person=pd.get("person",{})
-            lineup.append({"id":pid,"name":person.get("fullName",f"Player {pid}"),"order":idx})
+            pos=(pd.get("position") or {}).get("abbreviation") or (pd.get("position") or {}).get("code") or ""
+            lineup.append({"id":pid,"name":person.get("fullName",f"Player {pid}"),"order":idx,"position":pos})
         result[side]=lineup
     return result
 
@@ -422,8 +494,10 @@ def staff_proxy_factor(staff):
     recent=shrink_mean(float(staff.get("recent_ra_pg",LEAGUE_RPG)),10,LEAGUE_RPG,15)
     recent3=shrink_mean(float(staff.get("recent3_ra_pg",recent)),3,LEAGUE_RPG,7)
     fatigue=float(staff.get("fatigue_index",0.35))
-    factor=.38*(era/LEAGUE_ERA)+.20*(whip/LEAGUE_WHIP)+.24*(recent/LEAGUE_RPG)+.12*(recent3/LEAGUE_RPG)+.06*(1+fatigue*.22)
-    return clamp(factor,.82,1.27)
+    workload=float(staff.get("workload_fatigue",fatigue))
+    factor=(.35*(era/LEAGUE_ERA)+.18*(whip/LEAGUE_WHIP)+.22*(recent/LEAGUE_RPG)+
+            .10*(recent3/LEAGUE_RPG)+.07*(1+fatigue*.22)+.08*(1+workload*.30))
+    return clamp(factor,.82,1.30)
 
 def project_full_game_ensemble(away_f5,home_f5,away_form,home_form,away_staff,home_staff,park_factor=1.0,weather=None):
     park=clamp(park_factor,.93,1.10)
@@ -700,7 +774,67 @@ def rank_automatic_candidates_v5(items,max_items=5):
             break
     return selected
 
-def evaluate_selected_candidate_v5(item,odds):
+def expert_risk_flags(item,both_lineups_confirmed,away_staff,home_staff,weather):
+    flags=[]
+    if not item.get("confirmed",False): flags.append("información todavía provisional")
+    if item.get("agreement",1)<.80: flags.append("desacuerdo entre modelos")
+    if item.get("prob_high",item["prob"])-item.get("prob_low",item["prob"])>.14: flags.append("rango de incertidumbre amplio")
+    if item.get("volatility")=="high": flags.append("mercado de alta varianza")
+    if "Full Game" in item.get("category",""):
+        af=float((away_staff or {}).get("workload_fatigue",.35)); hf=float((home_staff or {}).get("workload_fatigue",.35))
+        if max(af,hf)>.58: flags.append("bullpen con carga reciente relevante")
+        flags.append("Full Game depende más del bullpen")
+    if weather and weather.get("precip_probability",0)>=50: flags.append("riesgo meteorológico")
+    return flags
+
+def expert_support_factors(item,game,away_f5,home_f5,fg_total,park_factor,weather,both_lineups_confirmed):
+    factors=[]
+    label=item.get("label","")
+    if item.get("agreement",0)>=.90: factors.append("consenso muy alto entre modelos")
+    elif item.get("agreement",0)>=.82: factors.append("buen consenso entre modelos")
+    if item.get("prob_low",0)>=.62: factors.append("probabilidad conservadora fuerte")
+    if item.get("confidence_score",0)>=70: factors.append("confianza estadística alta")
+    if both_lineups_confirmed: factors.append("lineups oficiales confirmados")
+    if "Over" in label and park_factor>=1.04: factors.append("parque favorable a producción ofensiva")
+    if "Under" in label and park_factor<=.97: factors.append("parque que reduce producción ofensiva")
+    if weather:
+        if weather.get("temp_f",72)>=85 and "Over" in label: factors.append("temperatura favorable al bateo")
+        if weather.get("temp_f",72)<=58 and "Under" in label: factors.append("temperatura favorable al pitcheo")
+    if "F5" in label: factors.append("reduce incertidumbre del bullpen")
+    if "ponches" in label: factors.append("matchup K del pitcher contra el orden rival")
+    if "hit" in label or "base" in label: factors.append("posición en lineup y tasa por PA regresada")
+    return factors[:4]
+
+def expert_read(item,game,away_f5,home_f5,fg_total,park_factor,weather,both_lineups_confirmed,away_staff,home_staff):
+    supports=expert_support_factors(item,game,away_f5,home_f5,fg_total,park_factor,weather,both_lineups_confirmed)
+    risks=expert_risk_flags(item,both_lineups_confirmed,away_staff,home_staff,weather)
+    sc=item.get("confidence_score",0)
+    if sc>=75 and item.get("prob_low",0)>=.60: stance="APOYA FUERTE"
+    elif sc>=58 and item.get("prob_low",0)>=.56: stance="APOYA"
+    elif sc>=48: stance="OBSERVAR"
+    else: stance="EVITAR"
+    return {"stance":stance,"supports":supports,"risks":risks,
+            "main_risk":risks[0] if risks else "sin riesgo estructural dominante detectado"}
+
+def build_avoid_list(items,selected_labels,max_items=4):
+    avoids=[]
+    for item in items:
+        if item["label"] in selected_labels: continue
+        x=dict(item);x["confidence_score"]=confidence_score(x)
+        low=x.get("prob_low",x["prob"]); width=x.get("prob_high",x["prob"])-low
+        reasons=[]
+        if x["prob"]>=.60 and low<.54: reasons.append("porcentaje central atractivo pero piso conservador insuficiente")
+        if x.get("agreement",1)<.76: reasons.append("desacuerdo alto")
+        if width>.16: reasons.append("incertidumbre amplia")
+        if x.get("volatility")=="high": reasons.append("varianza alta")
+        if "Full Game BETA" in x.get("category","") and x["confidence_score"]<55: reasons.append("bullpen todavía domina la incertidumbre")
+        if reasons:
+            x["avoid_reasons"]=reasons
+            x["avoid_score"]=len(reasons)*10 + max(0,.62-low)*100 + max(0,55-x["confidence_score"])/3
+            avoids.append(x)
+    return sorted(avoids,key=lambda x:x["avoid_score"],reverse=True)[:max_items]
+
+def evaluate_selected_candidate_v6(item,odds):
     p=item["prob"]
     p_cons=item.get("prob_low",p)
     fair=prob_to_decimal(p)
@@ -732,12 +866,30 @@ def evaluate_selected_candidate_v5(item,odds):
     }
 
 
-# ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V5.1", page_icon="⚾", layout="wide")
-st_autorefresh(interval=120000, key="v51_refresh")
 
-st.title("⚾ MLB Betting Hub — V5.1")
-st.caption("Motor estadístico mejorado: regresión a la media + ensemble + simulación + incertidumbre.")
+def format_game_time_cdmx(game_date_utc):
+    """Convierte el gameDate ISO de MLB (UTC) a hora de Ciudad de México."""
+    if not game_date_utc:
+        return "Hora N/D"
+    try:
+        raw=str(game_date_utc).replace("Z","+00:00")
+        dt=datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=ZoneInfo("UTC"))
+        local=dt.astimezone(ZoneInfo("America/Mexico_City"))
+        hour=local.strftime("%I").lstrip("0") or "12"
+        minute=local.strftime("%M")
+        ampm=local.strftime("%p")
+        return f"{hour}:{minute} {ampm} CDMX"
+    except Exception:
+        return "Hora N/D"
+
+# ================= APP UI =================
+st.set_page_config(page_title="MLB Betting Hub V6.1", page_icon="⚾", layout="wide")
+st_autorefresh(interval=120000, key="v61_refresh")
+
+st.title("⚾ MLB Betting Hub — V6.1")
+st.caption("Analista cuantitativo MLB: consenso de modelos + simulación + matchup + riesgos + contexto del juego.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -749,14 +901,17 @@ if not games:
     st.stop()
 
 with c2:
-    game_label=st.selectbox("⚾ Partido",[g["label"] for g in games])
-
-game=next(g for g in games if g["label"]==game_label)
+    game_options = {
+        f"{g['label']} — {format_game_time_cdmx(g.get('game_time_local'))}": g
+        for g in games
+    }
+    game_label = st.selectbox("⚾ Partido", list(game_options.keys()))
+game = game_options[game_label]
 
 game_state_key=f"{selected_date.isoformat()}-{game['game_pk']}"
-if st.session_state.get("v51_game_key")!=game_state_key:
-    st.session_state["v51_game_key"]=game_state_key
-    st.session_state["v51_analysis_ready"]=False
+if st.session_state.get("v6_game_key")!=game_state_key:
+    st.session_state["v6_game_key"]=game_state_key
+    st.session_state["v6_analysis_ready"]=False
 
 with st.spinner("Consultando MLB, contexto y lineups..."):
     away_form=get_team_form(game["away_id"],selected_date.isoformat())
@@ -765,6 +920,10 @@ with st.spinner("Consultando MLB, contexto y lineups..."):
     home_pitch=get_pitcher_stats(game["home_pitcher_id"],selected_date.year) if game["home_pitcher_id"] else None
     away_staff=get_team_pitching_profile(game["away_id"],selected_date.year,selected_date.isoformat())
     home_staff=get_team_pitching_profile(game["home_id"],selected_date.year,selected_date.isoformat())
+    away_bp_work=get_bullpen_workload(game["away_id"],selected_date.isoformat())
+    home_bp_work=get_bullpen_workload(game["home_id"],selected_date.isoformat())
+    if away_staff is not None: away_staff={**away_staff,"workload_fatigue":away_bp_work.get("fatigue_score",.35)}
+    if home_staff is not None: home_staff={**home_staff,"workload_fatigue":home_bp_work.get("fatigue_score",.35)}
 
     park=get_stadium_context(game["home_abbr"])
     weather=get_weather(park["lat"],park["lon"],selected_date.isoformat(),game.get("game_time_local")) if park else None
@@ -830,6 +989,7 @@ props=build_prop_candidates_v5(
 # =========================
 st.divider()
 st.subheader("📋 Contexto del partido")
+st.caption(f"🕒 Hora de inicio CDMX: **{format_game_time_cdmx(game.get('game_time_local'))}**")
 
 ctx1,ctx2,ctx3=st.columns([1,1,1.1])
 with ctx1:
@@ -881,6 +1041,31 @@ with lu2:
             st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
     else: st.caption("MLB todavía no publicó el orden al bat.")
 
+st.markdown("### 🧯 Bullpen y catcher")
+bp1,bp2=st.columns(2)
+with bp1:
+    catcher=next((p for p in away_lineup if p.get("position")=="C"),None)
+    st.write(f"**{game['away_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
+    if away_bp_work.get("available"):
+        st.caption(
+            f"Relevistas: {away_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
+            f"{away_bp_work['yesterday_pitches']} ayer · fatiga {away_bp_work['fatigue_score']*100:.0f}%"
+        )
+        if away_bp_work.get("heavy_arms"):
+            st.caption("Brazos cargados: "+", ".join(x["name"] for x in away_bp_work["heavy_arms"][:3]))
+    else: st.caption("Carga de bullpen: N/D")
+with bp2:
+    catcher=next((p for p in home_lineup if p.get("position")=="C"),None)
+    st.write(f"**{game['home_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
+    if home_bp_work.get("available"):
+        st.caption(
+            f"Relevistas: {home_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
+            f"{home_bp_work['yesterday_pitches']} ayer · fatiga {home_bp_work['fatigue_score']*100:.0f}%"
+        )
+        if home_bp_work.get("heavy_arms"):
+            st.caption("Brazos cargados: "+", ".join(x["name"] for x in home_bp_work["heavy_arms"][:3]))
+    else: st.caption("Carga de bullpen: N/D")
+
 st.caption(
     f"Última consulta: {datetime.now().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
     "refresco automático aproximado cada 2 minutos."
@@ -894,10 +1079,10 @@ with b2:
 
 if update_now:
     st.cache_data.clear()
-    st.session_state["v51_analysis_ready"]=False
+    st.session_state["v6_analysis_ready"]=False
     st.rerun()
 if analyze_now:
-    st.session_state["v51_analysis_ready"]=True
+    st.session_state["v6_analysis_ready"]=True
 
 # =========================
 # Construcción automática
@@ -988,32 +1173,33 @@ def build_analysis_summary(items, selected):
     }
 
 analysis_summary=build_analysis_summary(automatic,ranked_auto)
+avoid_list=build_avoid_list(automatic,{x["label"] for x in ranked_auto},max_items=4)
 
 # Historial básico en sesión
-if "v51_history" not in st.session_state:
-    st.session_state["v51_history"]=[]
+if "v6_history" not in st.session_state:
+    st.session_state["v6_history"]=[]
 
 # =========================
 # Pantallas
 # =========================
-tab1,tab2,tab3=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios","3️⃣ Historial"])
+tab1,tab2,tab3,tab4=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios","3️⃣ Analista experto","4️⃣ Historial"])
 
 with tab1:
     st.subheader(f"🧠 Análisis estadístico {game['away_abbr']} @ {game['home_abbr']}")
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V5.1 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
+    q3.caption("V6 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V5.1 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V6 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
     s2.metric("Pasaron filtros",analysis_summary["passed"])
     s3.metric("Descartados",analysis_summary["discarded"])
 
-    if not st.session_state.get("v51_analysis_ready",False):
+    if not st.session_state.get("v6_analysis_ready",False):
         st.info("👆 Revisa el contexto y pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("⚪ PASS ESTADÍSTICO — No encontré suficientes opciones robustas. V5 no fuerza cinco picks.")
@@ -1031,6 +1217,9 @@ with tab1:
                 f"Acuerdo **{item.get('agreement',0)*100:.0f}%** · {state}"
             )
             st.caption(item["reason"])
+            expert=expert_read(item,game,away_f5,home_f5,fg_total,park_factor,weather,both_confirmed,away_staff,home_staff)
+            support_txt=" · ".join(expert["supports"][:3]) if expert["supports"] else "sin apoyos adicionales fuertes"
+            st.caption(f"🧠 {expert['stance']} · {support_txt} · Riesgo principal: {expert['main_risk']}")
 
         if analysis_summary["near"]:
             st.markdown("### 🟡 Cerca de calificar")
@@ -1048,11 +1237,11 @@ with tab1:
                 )
                 st.caption("No calificó por: " + " · ".join(reason_parts))
 
-    if st.session_state.get("v51_analysis_ready",False) and ranked_auto:
-        if st.button("💾 Guardar este análisis en historial",key="save_v51_analysis"):
+    if st.session_state.get("v6_analysis_ready",False) and ranked_auto:
+        if st.button("💾 Guardar este análisis en historial",key="save_v6_analysis"):
             stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for item in ranked_auto:
-                st.session_state["v51_history"].append({
+                st.session_state["v6_history"].append({
                     "timestamp":stamp,
                     "date":selected_date.isoformat(),
                     "game":game["label"],
@@ -1061,6 +1250,8 @@ with tab1:
                     "prob_low":round(item.get("prob_low",item["prob"]),4),
                     "prob_high":round(item.get("prob_high",item["prob"]),4),
                     "confidence":item["confidence_score"],
+                    "agreement":round(item.get("agreement",0),4),
+                    "category":item.get("category",""),
                     "confirmed":item.get("confirmed",False),
                     "result":""
                 })
@@ -1084,7 +1275,7 @@ with tab1:
             "CV simulación Full":round(fg_sim["cv"],3),
         })
 
-        st.write("**Qué hace V5.1 diferente**")
+        st.write("**Qué hace V6 diferente**")
         st.write("• Regresa muestras pequeñas hacia la media MLB.")
         st.write("• Mezcla modelo conservador, balanceado y sensible a forma reciente.")
         st.write("• Simula incertidumbre del parámetro de carreras, no solo resultados Poisson fijos.")
@@ -1098,14 +1289,16 @@ with tab1:
                 st.caption(
                     f"{game['away_abbr']}: ERA {away_staff['era']:.2f} · WHIP {away_staff['whip']:.2f} · "
                     f"RA/G L10 {away_staff['recent_ra_pg']:.2f} · RA/G L3 {away_staff.get('recent3_ra_pg',away_staff['recent_ra_pg']):.2f} · "
-                    f"fatiga proxy {away_staff.get('fatigue_index',0)*100:.0f}%"
+                    f"fatiga base {away_staff.get('fatigue_index',0)*100:.0f}% · "
+                    f"carga real reciente {away_staff.get('workload_fatigue',0)*100:.0f}%"
                 )
         with bp2:
             if home_staff:
                 st.caption(
                     f"{game['home_abbr']}: ERA {home_staff['era']:.2f} · WHIP {home_staff['whip']:.2f} · "
                     f"RA/G L10 {home_staff['recent_ra_pg']:.2f} · RA/G L3 {home_staff.get('recent3_ra_pg',home_staff['recent_ra_pg']):.2f} · "
-                    f"fatiga proxy {home_staff.get('fatigue_index',0)*100:.0f}%"
+                    f"fatiga base {home_staff.get('fatigue_index',0)*100:.0f}% · "
+                    f"carga real reciente {home_staff.get('workload_fatigue',0)*100:.0f}%"
                 )
 
         st.write("**Datos disponibles**")
@@ -1116,7 +1309,7 @@ with tab2:
     st.subheader("💰 ¿El precio de Draftea compensa el riesgo?")
     st.caption("Las 5 recomendaciones aparecen seleccionadas. Quita cualquiera que Draftea no tenga.")
 
-    if not st.session_state.get("v51_analysis_ready",False):
+    if not st.session_state.get("v6_analysis_ready",False):
         st.info("Primero pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("No hay recomendaciones robustas que evaluar.")
@@ -1133,9 +1326,9 @@ with tab2:
             c2.caption(f"Cuota objetivo ≥ {target:.2f}x")
             odds=c3.number_input(
                 f"Momio {idx+1}",1.01,100.0,1.80,.01,
-                format="%.2f",key=f"odd_v51_{idx}"
+                format="%.2f",key=f"odd_v6_{idx}"
             )
-            res=evaluate_selected_candidate_v5(item,odds)
+            res=evaluate_selected_candidate_v6(item,odds)
             evaluated.append({**item,**res,"odds":odds})
 
         if evaluated:
@@ -1160,13 +1353,71 @@ with tab2:
 
 
 with tab3:
+    st.subheader("🧠 Analista experto del partido")
+    st.caption("Esta capa interpreta la salida estadística; no inventa porcentajes ni sustituye el modelo.")
+
+    if not st.session_state.get("v6_analysis_ready",False):
+        st.info("Primero pulsa **🧠 Analizar partido**.")
+    else:
+        if ranked_auto:
+            best=ranked_auto[0]
+            er=expert_read(best,game,away_f5,home_f5,fg_total,park_factor,weather,both_confirmed,away_staff,home_staff)
+            st.markdown(f"### 🎯 Lectura principal: {er['stance']} — {best['label']}")
+            a,b,c=st.columns(3)
+            a.metric("Prob. conservadora",f"{best['prob_low']*100:.1f}%")
+            b.metric("Confianza",f"{best['confidence_score']}/100")
+            c.metric("Acuerdo",f"{best.get('agreement',0)*100:.0f}%")
+
+            st.markdown("**Lo que apoya la lectura**")
+            if er["supports"]:
+                for x in er["supports"]: st.write(f"✅ {x}")
+            else: st.write("• No hay apoyos contextuales adicionales fuertes.")
+
+            st.markdown("**Riesgos que un analista no debería ignorar**")
+            if er["risks"]:
+                for x in er["risks"]: st.write(f"⚠️ {x}")
+            else: st.write("✅ No detecté un riesgo estructural dominante con los datos disponibles.")
+
+            st.markdown("**Lectura del partido**")
+            direction="producción ofensiva" if "Over" in best["label"] else "contención de carreras" if "Under" in best["label"] else "ventaja relativa"
+            lineup_txt="con lineups confirmados" if both_confirmed else "todavía sin ambos lineups oficiales"
+            st.write(
+                f"El modelo encuentra su señal más estable en **{best['label']}**. "
+                f"La lectura se basa en {direction}, {lineup_txt}, el acuerdo entre submodelos y la simulación. "
+                f"El principal motivo para no aumentar más la confianza es **{er['main_risk']}**."
+            )
+        else:
+            st.info("⚪ El analista experto coincide con PASS: no hay una señal suficientemente robusta.")
+
+        st.markdown("### 🚫 Qué evitar por ahora")
+        if avoid_list:
+            for i,x in enumerate(avoid_list,1):
+                st.write(
+                    f"**{i}. {x['label']}** — central {x['prob']*100:.1f}% · "
+                    f"conservadora {x.get('prob_low',x['prob'])*100:.1f}% · confianza {x['confidence_score']}/100"
+                )
+                st.caption("Evitar/esperar: "+" · ".join(x["avoid_reasons"]))
+        else:
+            st.caption("No detecté mercados especialmente engañosos entre los analizados.")
+
+        st.markdown("### 🧩 Consenso del sistema")
+        if ranked_auto:
+            for x in ranked_auto[:5]:
+                st.write(
+                    f"**{x['label']}** — acuerdo {x.get('agreement',0)*100:.0f}% · "
+                    f"rango {x.get('prob_low',x['prob'])*100:.1f}–{x.get('prob_high',x['prob'])*100:.1f}% · "
+                    f"confianza {x['confidence_score']}/100"
+                )
+        st.caption("Statcast avanzado (xwOBA/xSLG/Barrel/Hard-Hit) queda como la siguiente integración; V6 no lo simula ni lo inventa.")
+
+with tab4:
     st.subheader("📚 Historial y backtesting básico")
     st.caption(
         "Este historial vive en la sesión actual de Streamlit. "
         "Descarga el CSV para conservarlo; todavía no es almacenamiento permanente."
     )
 
-    history=st.session_state.get("v51_history",[])
+    history=st.session_state.get("v6_history",[])
     if not history:
         st.info("Aún no has guardado análisis.")
     else:
@@ -1187,16 +1438,16 @@ with tab3:
         st.download_button(
             "⬇️ Descargar historial CSV",
             data=output.getvalue().encode("utf-8"),
-            file_name=f"mlb_v51_historial_{selected_date.isoformat()}.csv",
+            file_name=f"mlb_v6_historial_{selected_date.isoformat()}.csv",
             mime="text/csv"
         )
 
-        if st.button("🗑️ Limpiar historial de esta sesión",key="clear_v51_history"):
-            st.session_state["v51_history"]=[]
+        if st.button("🗑️ Limpiar historial de esta sesión",key="clear_v6_history"):
+            st.session_state["v6_history"]=[]
             st.rerun()
 
 st.divider()
 st.caption(
-    "V5.1 experimental. La probabilidad mostrada no es una garantía. "
-    "La calibración histórica/backtesting sigue siendo necesaria antes de considerar estas probabilidades validadas."
+    "V6 experimental. La probabilidad mostrada no es una garantía. "
+    "La calibración histórica/backtesting sigue siendo necesaria. Statcast avanzado todavía no está integrado en esta versión."
 )

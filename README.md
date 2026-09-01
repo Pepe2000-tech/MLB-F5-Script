@@ -1,32 +1,42 @@
-# MLB Betting Hub V5.1
+# MLB Betting Hub V6.1
 
-Mejoras principales sobre V5:
+V6.1 conserva el motor y la interfaz de V6 y agrega horario de inicio de los partidos en hora de Ciudad de México.
 
-- Veredicto APOSTAR / LEAN / PASS alineado con EV conservador, cuota objetivo y confianza.
-- Resumen de cuántos mercados se analizaron, cuántos pasaron y cuántos se descartaron.
-- Sección `Cerca de calificar`.
-- Historial básico por sesión + descarga CSV para comenzar backtesting.
-- Pitcher Ks mejorados con:
-  - K-rate del pitcher cuando está disponible
-  - K-rate ponderado del lineup rival
-  - innings esperados
-  - regresión a la media
-- Bullpen/staff proxy mejorado con:
-  - ERA / WHIP
-  - RA/G últimos 10
-  - RA/G últimos 3
-  - fatiga proxy
-- Mantiene:
-  - contexto visible
-  - clima
-  - estadio
-  - pitchers
-  - lineups
-  - actualizar datos
-  - analizar partido
-  - Monte Carlo
-  - rangos de incertidumbre
+## Nuevo
+- El selector de partido muestra: `EQUIPO @ EQUIPO — HORA CDMX`.
+- El bloque `Contexto del partido` muestra también la hora de inicio CDMX.
+- La conversión usa la zona `America/Mexico_City`, por lo que no se usa un desplazamiento fijo manual.
+- No se cambia la lógica estadística ni las recomendaciones de V6.
 
-Importante:
-el historial en Streamlit Community Cloud no es almacenamiento permanente.
-Descarga el CSV para conservarlo. La calibración histórica real sigue siendo la siguiente etapa.
+# MLB Betting Hub V6
+
+V6 conserva el flujo sencillo de V5.1 y añade una capa de análisis tipo "analista experto".
+
+## Mejoras V6
+- Contexto visible de pitchers, clima, estadio y lineups.
+- Posición defensiva en lineup cuando MLB la publica; identifica catcher.
+- Bullpen reciente con pitch counts reales de relevistas en los 3 días previos cuando StatsAPI lo permite.
+- Brazos cargados: identifica relevistas con uso elevado reciente.
+- Full Game incorpora la carga reciente del bullpen al proxy.
+- Matchup de pitcher Ks pondera K-rate de cada bateador según el orden al bat.
+- Nueva pestaña `Analista experto`:
+  - lectura principal
+  - factores a favor
+  - riesgos
+  - qué evitar
+  - consenso del sistema
+- Ranking sigue usando probabilidad central, conservadora, incertidumbre, calidad y acuerdo.
+- Historial guarda también categoría y acuerdo de modelos.
+
+## Qué NO hace V6
+- No inventa Statcast.
+- Todavía no usa xwOBA/xSLG/Barrel/Hard-Hit directamente.
+- No conoce lesiones o noticias no publicadas en MLB StatsAPI.
+- La capa "analista experto" interpreta reglas/evidencia; no es un LLM externo.
+
+## Siguiente capa recomendada
+1. Statcast fiable y cacheado.
+2. Noticias/lesiones/contexto pregame.
+3. Backtesting persistente y resultados automáticos.
+4. Calibración por mercado.
+
