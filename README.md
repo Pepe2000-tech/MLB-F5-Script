@@ -1,35 +1,32 @@
-# MLB Betting Hub V5
+# MLB Betting Hub V5.1
 
-V5 cambia el motor estadístico manteniendo la interfaz simple.
+Mejoras principales sobre V5:
 
-## Motor nuevo
-- Regresión a la media para ofensiva, pitchers y props.
-- Ensemble de 3 submodelos F5:
-  - conservador
-  - balanceado
-  - sensible a forma reciente
-- Monte Carlo de 24,000 escenarios.
-- Gamma-Poisson para incorporar incertidumbre del parámetro de carreras.
-- Probabilidad central + rango plausible.
-- Score de confianza 0-100.
-- Penalización por:
-  - lineups pendientes
-  - calidad incompleta
-  - desacuerdo entre modelos
-  - volatilidad del mercado
-- Props de hits con aproximación binomial y tasa regresada.
-- Pitcher Ks con K/9 regresado, innings esperados y K-rate rival.
-- Full Game sigue usando bullpen/staff proxy y se identifica como BETA.
+- Veredicto APOSTAR / LEAN / PASS alineado con EV conservador, cuota objetivo y confianza.
+- Resumen de cuántos mercados se analizaron, cuántos pasaron y cuántos se descartaron.
+- Sección `Cerca de calificar`.
+- Historial básico por sesión + descarga CSV para comenzar backtesting.
+- Pitcher Ks mejorados con:
+  - K-rate del pitcher cuando está disponible
+  - K-rate ponderado del lineup rival
+  - innings esperados
+  - regresión a la media
+- Bullpen/staff proxy mejorado con:
+  - ERA / WHIP
+  - RA/G últimos 10
+  - RA/G últimos 3
+  - fatiga proxy
+- Mantiene:
+  - contexto visible
+  - clima
+  - estadio
+  - pitchers
+  - lineups
+  - actualizar datos
+  - analizar partido
+  - Monte Carlo
+  - rangos de incertidumbre
 
-## Flujo
-1. Ver contexto completo.
-2. Actualizar datos.
-3. Analizar partido.
-4. Obtener hasta 5 oportunidades robustas.
-5. Evaluar las 5 con momios reales.
-
-V5 no fuerza cinco selecciones si no encuentra suficiente robustez.
-
-## Importante
-Esta V5 todavía no está históricamente calibrada.
-La siguiente etapa recomendada es guardar predicciones/resultados y hacer backtesting/calibración.
+Importante:
+el historial en Streamlit Community Cloud no es almacenamiento permanente.
+Descarga el CSV para conservarlo. La calibración histórica real sigue siendo la siguiente etapa.

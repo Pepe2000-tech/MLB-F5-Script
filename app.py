@@ -152,7 +152,15 @@ def get_team_pitching_profile(team_id,season,target_date):
 
     recent=allowed[-10:]
     recent_ra=sum(recent)/len(recent) if recent else 4.4
-    return {"era":era,"whip":whip,"recent_ra_pg":recent_ra}
+    recent3=allowed[-3:]
+    recent3_ra=sum(recent3)/len(recent3) if recent3 else recent_ra
+    games_last3=len(recent3)
+    fatigue_index=clamp_local((games_last3/3)*0.55 + max(0,recent3_ra-4.4)/6*0.45,0,1)
+    return {
+        "era":era,"whip":whip,"recent_ra_pg":recent_ra,
+        "recent3_ra_pg":recent3_ra,"games_last3":games_last3,
+        "fatigue_index":fatigue_index
+    }
 
 @st.cache_data(ttl=60)
 def get_lineups(game_pk):
@@ -173,6 +181,9 @@ def get_lineups(game_pk):
 def _f(v,d=0.0):
     try:return float(v)
     except:return d
+
+def clamp_local(x,lo,hi):
+    return max(lo,min(hi,x))
 
 @st.cache_data(ttl=1800)
 def get_hitter_stats(player_id,season,opposing_hand="R"):
@@ -409,7 +420,10 @@ def staff_proxy_factor(staff):
     era=shrink_mean(float(staff.get("era",LEAGUE_ERA)),80,LEAGUE_ERA,60)
     whip=shrink_mean(float(staff.get("whip",LEAGUE_WHIP)),80,LEAGUE_WHIP,60)
     recent=shrink_mean(float(staff.get("recent_ra_pg",LEAGUE_RPG)),10,LEAGUE_RPG,15)
-    return clamp(.43*(era/LEAGUE_ERA)+.22*(whip/LEAGUE_WHIP)+.35*(recent/LEAGUE_RPG),.82,1.24)
+    recent3=shrink_mean(float(staff.get("recent3_ra_pg",recent)),3,LEAGUE_RPG,7)
+    fatigue=float(staff.get("fatigue_index",0.35))
+    factor=.38*(era/LEAGUE_ERA)+.20*(whip/LEAGUE_WHIP)+.24*(recent/LEAGUE_RPG)+.12*(recent3/LEAGUE_RPG)+.06*(1+fatigue*.22)
+    return clamp(factor,.82,1.27)
 
 def project_full_game_ensemble(away_f5,home_f5,away_form,home_form,away_staff,home_staff,park_factor=1.0,weather=None):
     park=clamp(park_factor,.93,1.10)
@@ -533,16 +547,30 @@ def build_prop_candidates_v5(away_pitcher,home_pitcher,away_pitcher_name,home_pi
             k9_reg=shrink_mean(float(p.get("k9",LEAGUE_K9)),ip,LEAGUE_K9,50)
             exp_ip=shrink_mean(float(p.get("expected_ip",5.2)),max(p.get("games_started",0),1),5.2,7)
 
-            opp_rates=[x.get("k_rate") for x in opp_lineup if x.get("stats_available") and x.get("k_rate") is not None]
-            if opp_rates:
-                # Each batter rate already season based; regress team lineup K% toward league.
-                raw_opp=float(np.mean(opp_rates))
-                opp_k=shrink_mean(raw_opp,len(opp_rates)*70,LEAGUE_K_PA,300)
+            opp_weighted=[]
+            weights=[]
+            lineup_weights=[1.10,1.08,1.06,1.04,1.02,1.00,.98,.96,.94]
+            for idx,x in enumerate(opp_lineup[:9]):
+                if x.get("stats_available") and x.get("k_rate") is not None:
+                    w=lineup_weights[idx]
+                    opp_weighted.append(float(x["k_rate"])*w)
+                    weights.append(w)
+            if opp_weighted and weights:
+                raw_opp=sum(opp_weighted)/sum(weights)
+                opp_k=shrink_mean(raw_opp,len(weights)*70,LEAGUE_K_PA,300)
             else:
                 opp_k=LEAGUE_K_PA
 
+            pitcher_k_rate=p.get("k_rate")
+            if pitcher_k_rate:
+                k_skill=shrink_mean(float(pitcher_k_rate),max(p.get("batters_faced",0),1),LEAGUE_K_PA,180)
+                k_skill_factor=clamp(k_skill/LEAGUE_K_PA,.82,1.22)
+            else:
+                k_skill_factor=clamp(k9_reg/LEAGUE_K9,.82,1.22)
+
             matchup=clamp(opp_k/LEAGUE_K_PA,.88,1.13)
-            mean_k=clamp(k9_reg*exp_ip/9*matchup,1.5,9.5)
+            base_mean=LEAGUE_K9*exp_ip/9
+            mean_k=clamp(base_mean*k_skill_factor*matchup,1.5,9.8)
 
             # Negative-binomial-like uncertainty via gamma-Poisson mixture.
             seed=stable_seed(name,"K")
@@ -673,7 +701,6 @@ def rank_automatic_candidates_v5(items,max_items=5):
     return selected
 
 def evaluate_selected_candidate_v5(item,odds):
-    # For price decisions, use central probability but penalize uncertainty.
     p=item["prob"]
     p_cons=item.get("prob_low",p)
     fair=prob_to_decimal(p)
@@ -681,15 +708,19 @@ def evaluate_selected_candidate_v5(item,odds):
     ev=p*odds-1
     conservative_ev=p_cons*odds-1
     target=(1.05/max(p_cons,.01))
+    confidence=item.get("confidence_score",0)
 
-    if conservative_ev>=.06 and odds>=target and item.get("confidence_score",0)>=60:
+    # Coherencia:
+    # si alcanza la cuota objetivo y EV conservador >=5%, puede ser APOSTAR
+    # siempre que la confianza estadística mínima sea aceptable.
+    if conservative_ev>=.05 and odds>=target and confidence>=50:
         verdict="APOSTAR"
-    elif conservative_ev>=.015 and odds>=fair_conservative:
+    elif conservative_ev>=.015 and odds>=fair_conservative and confidence>=45:
         verdict="LEAN"
     else:
         verdict="PASS"
 
-    score=conservative_ev*(item.get("confidence_score",50)/100)
+    score=conservative_ev*(max(confidence,1)/100)
     return {
         "ev":ev,
         "conservative_ev":conservative_ev,
@@ -702,10 +733,10 @@ def evaluate_selected_candidate_v5(item,odds):
 
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V5", page_icon="⚾", layout="wide")
-st_autorefresh(interval=120000, key="v5_refresh")
+st.set_page_config(page_title="MLB Betting Hub V5.1", page_icon="⚾", layout="wide")
+st_autorefresh(interval=120000, key="v51_refresh")
 
-st.title("⚾ MLB Betting Hub — V5")
+st.title("⚾ MLB Betting Hub — V5.1")
 st.caption("Motor estadístico mejorado: regresión a la media + ensemble + simulación + incertidumbre.")
 
 c1,c2=st.columns([1,2])
@@ -723,9 +754,9 @@ with c2:
 game=next(g for g in games if g["label"]==game_label)
 
 game_state_key=f"{selected_date.isoformat()}-{game['game_pk']}"
-if st.session_state.get("v5_game_key")!=game_state_key:
-    st.session_state["v5_game_key"]=game_state_key
-    st.session_state["v5_analysis_ready"]=False
+if st.session_state.get("v51_game_key")!=game_state_key:
+    st.session_state["v51_game_key"]=game_state_key
+    st.session_state["v51_analysis_ready"]=False
 
 with st.spinner("Consultando MLB, contexto y lineups..."):
     away_form=get_team_form(game["away_id"],selected_date.isoformat())
@@ -863,10 +894,10 @@ with b2:
 
 if update_now:
     st.cache_data.clear()
-    st.session_state["v5_analysis_ready"]=False
+    st.session_state["v51_analysis_ready"]=False
     st.rerun()
 if analyze_now:
-    st.session_state["v5_analysis_ready"]=True
+    st.session_state["v51_analysis_ready"]=True
 
 # =========================
 # Construcción automática
@@ -930,22 +961,59 @@ for side,abbr in [("away",game["away_abbr"]),("home",game["home_abbr"])]:
 automatic.extend(props)
 ranked_auto=rank_automatic_candidates_v5(automatic,max_items=5)
 
+# Resumen de todo lo analizado y mercados cercanos a calificar
+def build_analysis_summary(items, selected):
+    selected_labels={x["label"] for x in selected}
+    enriched=[]
+    for item in items:
+        x=dict(item)
+        x["confidence_score"]=confidence_score(x)
+        x["passes_lower_bound"]=x.get("prob_low",x["prob"])>=.54
+        x["passes_confidence"]=x["confidence_score"]>=48
+        x["passes"]=x["passes_lower_bound"] and x["passes_confidence"]
+        # Cercanía al umbral, priorizando mercados que fallaron por poco
+        lb_gap=max(0,.54-x.get("prob_low",x["prob"]))
+        conf_gap=max(0,48-x["confidence_score"])
+        x["near_score"]=lb_gap*100 + conf_gap/8
+        enriched.append(x)
+
+    passed=[x for x in enriched if x["passes"]]
+    near=[x for x in enriched if not x["passes"] and x["label"] not in selected_labels]
+    near=sorted(near,key=lambda x:(x["near_score"],-x["confidence_score"],-x["prob"]))[:5]
+    return {
+        "total":len(enriched),
+        "passed":len(passed),
+        "discarded":len(enriched)-len(passed),
+        "near":near
+    }
+
+analysis_summary=build_analysis_summary(automatic,ranked_auto)
+
+# Historial básico en sesión
+if "v51_history" not in st.session_state:
+    st.session_state["v51_history"]=[]
+
 # =========================
 # Pantallas
 # =========================
-tab1,tab2=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios"])
+tab1,tab2,tab3=st.tabs(["1️⃣ Qué buscar","2️⃣ Evaluar momios","3️⃣ Historial"])
 
 with tab1:
     st.subheader(f"🧠 Análisis estadístico {game['away_abbr']} @ {game['home_abbr']}")
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V5 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
+    q3.caption("V5.1 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V5 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V5.1 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
-    if not st.session_state.get("v5_analysis_ready",False):
+    s1,s2,s3=st.columns(3)
+    s1.metric("Mercados analizados",analysis_summary["total"])
+    s2.metric("Pasaron filtros",analysis_summary["passed"])
+    s3.metric("Descartados",analysis_summary["discarded"])
+
+    if not st.session_state.get("v51_analysis_ready",False):
         st.info("👆 Revisa el contexto y pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("⚪ PASS ESTADÍSTICO — No encontré suficientes opciones robustas. V5 no fuerza cinco picks.")
@@ -963,6 +1031,40 @@ with tab1:
                 f"Acuerdo **{item.get('agreement',0)*100:.0f}%** · {state}"
             )
             st.caption(item["reason"])
+
+        if analysis_summary["near"]:
+            st.markdown("### 🟡 Cerca de calificar")
+            st.caption("Estos mercados NO pasaron el filtro, pero quedaron relativamente cerca.")
+            for j,item in enumerate(analysis_summary["near"],1):
+                reason_parts=[]
+                if item.get("prob_low",item["prob"])<.54:
+                    reason_parts.append(f"conservadora {item.get('prob_low',item['prob'])*100:.1f}% < 54%")
+                if item["confidence_score"]<48:
+                    reason_parts.append(f"confianza {item['confidence_score']}/100 < 48")
+                st.write(
+                    f"**{j}. {item['label']}** — Central {item['prob']*100:.1f}% | "
+                    f"Rango {item.get('prob_low',item['prob'])*100:.1f}–{item.get('prob_high',item['prob'])*100:.1f}% | "
+                    f"Confianza {item['confidence_score']}/100"
+                )
+                st.caption("No calificó por: " + " · ".join(reason_parts))
+
+    if st.session_state.get("v51_analysis_ready",False) and ranked_auto:
+        if st.button("💾 Guardar este análisis en historial",key="save_v51_analysis"):
+            stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for item in ranked_auto:
+                st.session_state["v51_history"].append({
+                    "timestamp":stamp,
+                    "date":selected_date.isoformat(),
+                    "game":game["label"],
+                    "market":item["label"],
+                    "prob_central":round(item["prob"],4),
+                    "prob_low":round(item.get("prob_low",item["prob"]),4),
+                    "prob_high":round(item.get("prob_high",item["prob"]),4),
+                    "confidence":item["confidence_score"],
+                    "confirmed":item.get("confirmed",False),
+                    "result":""
+                })
+            st.success("Análisis guardado en esta sesión.")
 
     with st.expander("🔬 Ver modelo y simulación",expanded=False):
         a,b,c=st.columns(3)
@@ -982,12 +1084,29 @@ with tab1:
             "CV simulación Full":round(fg_sim["cv"],3),
         })
 
-        st.write("**Qué hace V5 diferente**")
+        st.write("**Qué hace V5.1 diferente**")
         st.write("• Regresa muestras pequeñas hacia la media MLB.")
         st.write("• Mezcla modelo conservador, balanceado y sensible a forma reciente.")
         st.write("• Simula incertidumbre del parámetro de carreras, no solo resultados Poisson fijos.")
         st.write("• Penaliza falta de lineup, mercados volátiles y desacuerdo entre modelos.")
         st.write("• Props de hits usan aproximación binomial con tasa regresada; Ks usan mezcla gamma-Poisson.")
+
+        st.write("**Bullpen / staff proxy V5.1**")
+        bp1,bp2=st.columns(2)
+        with bp1:
+            if away_staff:
+                st.caption(
+                    f"{game['away_abbr']}: ERA {away_staff['era']:.2f} · WHIP {away_staff['whip']:.2f} · "
+                    f"RA/G L10 {away_staff['recent_ra_pg']:.2f} · RA/G L3 {away_staff.get('recent3_ra_pg',away_staff['recent_ra_pg']):.2f} · "
+                    f"fatiga proxy {away_staff.get('fatigue_index',0)*100:.0f}%"
+                )
+        with bp2:
+            if home_staff:
+                st.caption(
+                    f"{game['home_abbr']}: ERA {home_staff['era']:.2f} · WHIP {home_staff['whip']:.2f} · "
+                    f"RA/G L10 {home_staff['recent_ra_pg']:.2f} · RA/G L3 {home_staff.get('recent3_ra_pg',home_staff['recent_ra_pg']):.2f} · "
+                    f"fatiga proxy {home_staff.get('fatigue_index',0)*100:.0f}%"
+                )
 
         st.write("**Datos disponibles**")
         for note in quality_notes:
@@ -997,7 +1116,7 @@ with tab2:
     st.subheader("💰 ¿El precio de Draftea compensa el riesgo?")
     st.caption("Las 5 recomendaciones aparecen seleccionadas. Quita cualquiera que Draftea no tenga.")
 
-    if not st.session_state.get("v5_analysis_ready",False):
+    if not st.session_state.get("v51_analysis_ready",False):
         st.info("Primero pulsa **🧠 Analizar partido**.")
     elif not ranked_auto:
         st.info("No hay recomendaciones robustas que evaluar.")
@@ -1014,7 +1133,7 @@ with tab2:
             c2.caption(f"Cuota objetivo ≥ {target:.2f}x")
             odds=c3.number_input(
                 f"Momio {idx+1}",1.01,100.0,1.80,.01,
-                format="%.2f",key=f"odd_v5_{idx}"
+                format="%.2f",key=f"odd_v51_{idx}"
             )
             res=evaluate_selected_candidate_v5(item,odds)
             evaluated.append({**item,**res,"odds":odds})
@@ -1039,8 +1158,45 @@ with tab2:
                     f"{x['verdict']}"
                 )
 
+
+with tab3:
+    st.subheader("📚 Historial y backtesting básico")
+    st.caption(
+        "Este historial vive en la sesión actual de Streamlit. "
+        "Descarga el CSV para conservarlo; todavía no es almacenamiento permanente."
+    )
+
+    history=st.session_state.get("v51_history",[])
+    if not history:
+        st.info("Aún no has guardado análisis.")
+    else:
+        import csv, io
+        st.write(f"Registros guardados: **{len(history)}**")
+        for i,row in enumerate(history[-20:],1):
+            st.write(
+                f"**{row['game']} · {row['market']}** — "
+                f"Central {row['prob_central']*100:.1f}% | "
+                f"Conservadora {row['prob_low']*100:.1f}% | "
+                f"Confianza {row['confidence']}/100"
+            )
+
+        output=io.StringIO()
+        writer=csv.DictWriter(output,fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+        st.download_button(
+            "⬇️ Descargar historial CSV",
+            data=output.getvalue().encode("utf-8"),
+            file_name=f"mlb_v51_historial_{selected_date.isoformat()}.csv",
+            mime="text/csv"
+        )
+
+        if st.button("🗑️ Limpiar historial de esta sesión",key="clear_v51_history"):
+            st.session_state["v51_history"]=[]
+            st.rerun()
+
 st.divider()
 st.caption(
-    "V5 experimental. La probabilidad mostrada no es una garantía. "
+    "V5.1 experimental. La probabilidad mostrada no es una garantía. "
     "La calibración histórica/backtesting sigue siendo necesaria antes de considerar estas probabilidades validadas."
 )
