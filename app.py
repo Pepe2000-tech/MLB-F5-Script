@@ -1734,19 +1734,24 @@ def express_qualifies_v721(item,use_odds=False):
     return True
 
 def market_group_v722(item):
+    """V7.2.5: familias concretas para que Express analice exactamente lo elegido."""
     fam=str(item.get("market_family","") or "")
-    if fam.startswith("f5_"): return "F5 / juego"
-    if fam.startswith("fg_"): return "Full Game"
-    if fam=="pitcher_k": return "Pitcher props"
+    if fam=="f5_total": return "F5 Carreras"
+    if fam=="fg_ml": return "Full Game ML"
+    if fam=="fg_total": return "Full Game Carreras"
+    if fam=="pitcher_k": return "Pitcher Ks"
     if fam in {"hits","total_bases","hrr","home_run"}: return "Batter props"
+    # F5 ML puede existir en el análisis individual, pero no forma parte de Express V7.2.5.
+    if fam=="f5_ml": return "F5 ML (no Express)"
     cat=str(item.get("category","") or "")
-    if "F5" in cat: return "F5 / juego"
-    if "Full Game" in cat: return "Full Game"
-    if "Pitcher" in cat: return "Pitcher props"
+    if "Pitcher" in cat: return "Pitcher Ks"
+    if "Full Game" in cat and "ML" in str(item.get("label","")): return "Full Game ML"
+    if "Full Game" in cat: return "Full Game Carreras"
+    if "F5" in cat: return "F5 Carreras"
     return "Batter props"
 
 def family_shortlist_v722(items, per_group=8):
-    """V7.2.4: preserva candidatos de TODAS las familias sin borrarlos por umbrales tempranos.
+    """V7.2.5: preserva candidatos de TODAS las familias sin borrarlos por umbrales tempranos.
     La clasificación APOSTAR/PASS se hace después. Así Express nunca aparenta no haber analizado.
     """
     enriched=[]
@@ -1756,7 +1761,7 @@ def family_shortlist_v722(items, per_group=8):
         x["express_group"]=market_group_v722(x)
         enriched.append(x)
     out=[]
-    for group in ["F5 / juego","Full Game","Pitcher props","Batter props"]:
+    for group in ["F5 Carreras","Full Game ML","Full Game Carreras","Pitcher Ks","Batter props"]:
         g=[x for x in enriched if x["express_group"]==group]
         g=sorted(g,key=lambda x:(x.get("prob_low",0),x.get("confidence_score",0),x.get("prob",0)),reverse=True)
         # Mantiene un bloque amplio de cada familia para el ranking global y el fallback.
@@ -1765,20 +1770,21 @@ def family_shortlist_v722(items, per_group=8):
 
 def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_groups=None):
     """V7.2.3: una sola familia no puede monopolizar Express."""
-    allowed_groups=set(allowed_groups or ["F5 / juego","Full Game","Pitcher props","Batter props"])
+    allowed_groups=set(allowed_groups or ["F5 Carreras","Full Game ML","Full Game Carreras","Pitcher Ks","Batter props"])
     pool=[x for x in pool if market_group_v722(x) in allowed_groups]
     if not automatic: return pool[:target_n]
     selected=[]; game_counts={}; player_counts={}; group_counts={}
     caps={
-        "Pitcher props": min(2,max(1,math.ceil(target_n*.20))),
+        "Pitcher Ks": min(2,max(1,math.ceil(target_n*.20))),
         "Batter props": max(1,math.ceil(target_n*.30)),
-        "F5 / juego": max(1,math.ceil(target_n*.40)),
-        "Full Game": min(2,max(1,math.ceil(target_n*.20))),
+        "F5 Carreras": max(1,math.ceil(target_n*.40)),
+        "Full Game ML": max(1,math.ceil(target_n*.30)),
+        "Full Game Carreras": max(1,math.ceil(target_n*.30)),
     }
     grouped={}
     for x in pool: grouped.setdefault(market_group_v722(x),[]).append(x)
     for g in grouped: grouped[g]=sorted(grouped[g],key=lambda z:z.get("express_safety_score",-9),reverse=True)
-    order=[g for g in ["F5 / juego","Batter props","Full Game","Pitcher props"] if g in allowed_groups]
+    order=[g for g in ["F5 Carreras","Full Game ML","Full Game Carreras","Batter props","Pitcher Ks"] if g in allowed_groups]
     idx={g:0 for g in order}; progress=True
     while len(selected)<target_n and progress:
         progress=False
@@ -1790,10 +1796,10 @@ def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_g
                 x=arr[idx[group]]; idx[group]+=1
                 game=x.get("game"); subj=x.get("subject","")
                 if game_counts.get(game,0)>=max_per_game: continue
-                if group in {"Pitcher props","Batter props"} and subj and player_counts.get(subj,0)>=1: continue
+                if group in {"Pitcher Ks","Batter props"} and subj and player_counts.get(subj,0)>=1: continue
                 selected.append(x); progress=True
                 game_counts[game]=game_counts.get(game,0)+1; group_counts[group]=group_counts.get(group,0)+1
-                if group in {"Pitcher props","Batter props"} and subj: player_counts[subj]=1
+                if group in {"Pitcher Ks","Batter props"} and subj: player_counts[subj]=1
                 break
     return selected
 
@@ -1827,12 +1833,7 @@ def analyze_game_express_v7(g,selected_date):
             items.append({"category":"F5","label":f"F5 {word} {line:g}","prob":p0,"prob_low":lo,"prob_high":hi,
                           "agreement":.90 if both else .75,"quality":q,"confirmed":both,"volatility":"medium",
                           "market_family":"f5_total","side":side,"line":line,"sample_values":totalvals,"subject":f"{g['away_abbr']} @ {g['home_abbr']}"})
-    # F5 moneyline candidates help diversify away from player props.
-    for side,abbr in [("away",g["away_abbr"]),("home",g["home_abbr"])]:
-        p0=sim_ml_prob(sim,side); lo,hi=_bands_from_sample_prob(p0,both,"medium")
-        items.append({"category":"F5","label":f"{abbr} F5 ML","prob":p0,"prob_low":lo,"prob_high":hi,
-                      "agreement":.86 if both else .72,"quality":q,"confirmed":both,"volatility":"medium",
-                      "market_family":"f5_ml","side":side,"line":0.0,"sample_values":None,"subject":abbr})
+    # V7.2.5: Express prioriza F5 carreras; F5 ML se mantiene solo en análisis individual.
 
     # Lightweight Full Game totals. Bullpen/staff adds uncertainty; these must clear the same conservative filters.
     away_staff=get_team_pitching_profile(g["away_id"],season,d)
@@ -1863,10 +1864,10 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.2.4", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.2.4 Alpha")
-st.caption("V7.2.4: Express siempre devuelve un Top útil + ranking por familias + momios opcionales + edición dentro del Top.")
-st.info("🧪 **V7.2.4 ALPHA** — Si no hay picks verdes, Express muestra las mejores alternativas por probabilidad con su riesgo claramente marcado. Full Game incluye ganador (Moneyline) y totales.")
+st.set_page_config(page_title="MLB Betting Hub V7.2.5", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.2.5 Alpha")
+st.caption("V7.2.5: Express con mercados concretos: F5 carreras, Full Game ML o carreras, props opcionales y edición dentro del Top.")
+st.info("🧪 **V7.2.5 ALPHA** — Elige exactamente qué analizar: F5 Carreras, Full Game ML, Full Game Carreras y props opcionales. Si no hay verdes, se muestran alternativas con riesgo claramente marcado.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -2340,7 +2341,12 @@ with tabExpress:
     lineup_mode=e2.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0)
     use_odds=e3.toggle("Usar momios de referencia",value=False,help="Apagado: elige por probabilidad, confianza y riesgo. Encendido: además valida el precio de mercado y consume créditos.")
     diversify=e4.checkbox("Diversificación automática",value=True,help="Ranking por familias. Pitcher Ks ya no puede monopolizar el Top.")
-    allowed_groups=st.multiselect("Mercados a incluir",["F5 / juego","Full Game","Pitcher props","Batter props"],default=["F5 / juego","Full Game","Pitcher props","Batter props"],help="F5 / juego incluye totales F5 y ganador F5. Full Game incluye totales y ganador Moneyline del partido completo. Puedes quitar cualquier familia.")
+    allowed_groups=st.multiselect(
+        "Mercados a analizar",
+        ["F5 Carreras","Full Game ML","Full Game Carreras","Pitcher Ks","Batter props"],
+        default=["F5 Carreras","Full Game ML","Full Game Carreras"],
+        help="F5 analiza solo carreras Over/Under. En Full Game puedes elegir por separado ganador (ML) y carreras Over/Under. Pitcher Ks y Batter props son opcionales."
+    )
     max_per_game=int(st.number_input("Máximo de selecciones por partido",min_value=1,max_value=3,value=1,step=1,help="Permite hasta 1, 2 o 3 selecciones del mismo juego dentro del Top."))
     show_risky=st.toggle("Si no hay suficientes verdes, mostrar las mejores alternativas con riesgo",value=True,help="No las marca como seguras: simplemente muestra las de mayor probabilidad disponible con su nivel de riesgo y confianza.")
     st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si faltan picks verdes, puedes ver el mejor Top disponible aunque incluya riesgo.")
@@ -2399,7 +2405,7 @@ with tabExpress:
         near=[z for z in prepool if (z.get("game_pk"),z.get("label")) not in chosen_ids]
         near=sorted(near,key=lambda z:z.get("express_safety_score",-9),reverse=True)
 
-        # V7.2.4 fallback: si el usuario pidió N y hay menos verdes, completa SOLO la visualización
+        # V7.2.5 fallback: si el usuario pidió N y hay menos verdes, completa SOLO la visualización
         # con las mejores alternativas disponibles, respetando familias y máximo por partido.
         fallback=[]
         if show_risky and len(chosen)<target_n:
@@ -2417,20 +2423,16 @@ with tabExpress:
                 game_counts[z.get("game")]=game_counts.get(z.get("game"),0)+1
         shown_all=chosen+fallback
         # Mejor ganador por partido (Full Game ML preferido; F5 ML si Full Game no está habilitado).
-        winner_pool=[z for z in prepool if z.get("market_family") in {"fg_ml","f5_ml"}]
+        winner_pool=[z for z in prepool if z.get("market_family")=="fg_ml"]
         best_winners=[]
         by_game={}
         for z in winner_pool:
             fam=z.get("market_family")
-            # Respeta los mercados elegidos por el usuario.
-            if fam=="fg_ml" and "Full Game" not in allowed_groups: continue
-            if fam=="f5_ml" and "F5 / juego" not in allowed_groups: continue
+            # Solo se calcula esta vista si el usuario activó Full Game ML.
+            if "Full Game ML" not in allowed_groups: continue
             key=(z.get("game"),fam)
             if key not in by_game or z.get("prob",0)>by_game[key].get("prob",0): by_game[key]=z
-        # Si hay Full Game, evita duplicar F5 del mismo juego en esta vista de ganador.
-        games_with_fg={k[0] for k in by_game if k[1]=="fg_ml"}
         for (gm,fam),z in by_game.items():
-            if fam=="f5_ml" and gm in games_with_fg: continue
             best_winners.append(z)
         best_winners=sorted(best_winners,key=lambda z:(z.get("prob_low",0),z.get("prob",0)),reverse=True)
         st.session_state["v724_best_winners"]=best_winners
@@ -2473,7 +2475,7 @@ with tabExpress:
         q3.metric("Verdes / APOSTAR",estats.get("greens",estats.get("qualified",0)))
         q4.metric("Top mostrado",estats.get("shown",0))
     best_winners=st.session_state.get("v724_best_winners",[])
-    if best_winners and ("Full Game" in st.session_state.get("v722_allowed_groups",[]) or "F5 / juego" in st.session_state.get("v722_allowed_groups",[])):
+    if best_winners and "Full Game ML" in st.session_state.get("v722_allowed_groups",[]):
         with st.expander("🏆 Ganador con mayor probabilidad por partido — aunque no llegue a verde", expanded=False):
             st.caption("Aquí V7 compara los dos equipos y muestra el lado con mayor probabilidad del modelo. Si no alcanza nivel verde, se marca como riesgo y NO como apuesta segura.")
             for z in best_winners[:15]:

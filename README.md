@@ -1,21 +1,25 @@
-# MLB Betting Hub V7.2.4 Alpha
+# MLB Betting Hub V7.2.5 Alpha
 
-Corrección de Express:
-- Express ya no queda visualmente vacío: muestra mercados generados, comparados, cuántos calificaron y el Top mostrado.
-- Si ninguno alcanza el umbral verde, muestra las mejores alternativas como CERCA / NO CALIFICA, sin convertirlas en apuestas recomendadas.
-- Full Game ahora incluye explícitamente Moneyline (ganador del partido completo) además de totales Over/Under.
-- F5 / juego incluye F5 Moneyline y F5 Totals.
-- Momios siguen siendo opcionales.
-- Ranking por familias y límites de Pitcher props se mantienen.
-- Contexto del partido permanece oculto por defecto.
-- Edición de línea dentro de Express se mantiene y pasa a Evaluar momios.
+V7.2.5 hace que Express permita elegir mercados concretos en lugar de agruparlos de forma ambigua.
 
-V7.2.4 no garantiza resultados. El objetivo es hacer visible el análisis completo sin rellenar el Top con apuestas débiles.
+## Cambios de V7.2.5
+- **F5 Carreras**: Express analiza únicamente Over/Under de carreras en las primeras 5 entradas. F5 Moneyline deja de formar parte de Express.
+- **Full Game ML**: opción independiente para buscar al ganador del partido completo.
+- **Full Game Carreras**: opción independiente para buscar Over/Under de carreras del juego completo.
+- **Pitcher Ks** y **Batter props** siguen disponibles, pero son opcionales.
+- Por defecto Express arranca con **F5 Carreras + Full Game ML + Full Game Carreras**, evitando que props de pitchers aparezcan si el usuario no los activa.
+- La diversificación y el máximo de selecciones por partido continúan respetándose.
+- Si Full Game ML está activado, se mantiene la vista **Ganador con mayor probabilidad por partido**.
+- Si no hay suficientes verdes, Express puede mostrar las mejores alternativas con riesgo claramente identificado.
+- Momios de referencia siguen siendo opcionales.
+- La edición de línea dentro de Express sigue pasando la selección ajustada a **Evaluar momios**.
 
+## Flujo recomendado
+1. Selecciona lineups completos o pendientes.
+2. Elige los mercados exactos que quieres analizar.
+3. Decide si deseas usar momios de referencia.
+4. Ejecuta Express.
+5. Edita una línea dentro de la propia tarjeta si Draftea ofrece otra.
+6. Revisa la selección ajustada en Evaluar momios.
 
-## V7.2.4
-- Express ya no elimina candidatos demasiado pronto: siempre conserva mercados analizados.
-- Si no hay suficientes verdes, puede completar la vista con las alternativas de mayor probabilidad, claramente marcadas como riesgo.
-- Nueva sección “Ganador con mayor probabilidad por partido” para comparar directamente ambos equipos (ML).
-- “Máximo de selecciones por partido” ahora es un campo numérico 1–3, más fácil de usar que el slider.
-- La edición de línea/momio desde Express también funciona para alternativas de riesgo y se pasa a Evaluar momios.
+La aplicación no garantiza resultados ni apuestas seguras; prioriza probabilidad, confianza y riesgo y puede marcar alternativas cuando ninguna opción alcanza el umbral de recomendación.
