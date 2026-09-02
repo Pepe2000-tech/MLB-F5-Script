@@ -1064,7 +1064,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
                     "prob":prob,"prob_low":lo,"prob_high":hi,"agreement":.86 if opp_lineup_confirmed else .68,
                     "quality":86 if opp_lineup_confirmed else 68,"confirmed":opp_lineup_confirmed,"volatility":"medium",
                     "market_family":"pitcher_k","side":side,"line":line,"subject":name,"sample_values":ks,
-                    "reason":f"V7.2.2 K audit · media ~{mean_k:.1f} K · K/9 regresado {k9_reg:.2f} · IP ~{exp_ip:.1f} · K% rival {opp_k*100:.1f}% · lineup rival {'confirmado' if opp_lineup_confirmed else 'provisional'}."
+                    "reason":f"V7.2.3 K audit · media ~{mean_k:.1f} K · K/9 regresado {k9_reg:.2f} · IP ~{exp_ip:.1f} · K% rival {opp_k*100:.1f}% · lineup rival {'confirmado' if opp_lineup_confirmed else 'provisional'}."
                 })
 
     def hitters(lineup):
@@ -1075,7 +1075,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
             split_adj=clamp(float(p.get("ops",LEAGUE_OPS))/LEAGUE_OPS,.88,1.12)
             rng=np.random.default_rng(stable_seed(p['name'],"HITTER-V7"))
 
-            # V7.2.2: simulate PA outcomes (1B/2B/3B/HR/out) instead of a Poisson shortcut for total bases.
+            # V7.2.3: simulate PA outcomes (1B/2B/3B/HR/out) instead of a Poisson shortcut for total bases.
             npa=max(1,int(round(pa)))
             pr_single=shrink_mean(clamp(float(p.get("single_rate",.145))*split_adj,0,.35),sample,.145,140)
             pr_double=shrink_mean(clamp(float(p.get("double_rate",.045))*split_adj,0,.16),sample,.045,160)
@@ -1112,7 +1112,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
                             "agreement":.90 if confirmed else .72,"quality":q if vol!="high" else max(55,q-12),
                             "confirmed":confirmed,"volatility":vol,"market_family":fam,"side":side,"line":line,
                             "subject":p['name'],"sample_values":vals,
-                            "reason":f"V7.2.2 O/U · ~{pa:.1f} PA · turno #{p['order']} · perfil 1B/2B/3B/HR + OPS/OBP/SLG regresado."
+                            "reason":f"V7.2.3 O/U · ~{pa:.1f} PA · turno #{p['order']} · perfil 1B/2B/3B/HR + OPS/OBP/SLG regresado."
                         })
     hitters(away_lineup);hitters(home_lineup)
     return props
@@ -1760,7 +1760,7 @@ def family_shortlist_v722(items, per_group=3):
     return out
 
 def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_groups=None):
-    """V7.2.2: una sola familia no puede monopolizar Express."""
+    """V7.2.3: una sola familia no puede monopolizar Express."""
     allowed_groups=set(allowed_groups or ["F5 / juego","Full Game","Pitcher props","Batter props"])
     pool=[x for x in pool if market_group_v722(x) in allowed_groups]
     if not automatic: return pool[:target_n]
@@ -1843,8 +1843,15 @@ def analyze_game_express_v7(g,selected_date):
                           "agreement":.78,"quality":max(35,q-8),"confirmed":False,"volatility":"medium",
                           "market_family":"fg_total","side":side,"line":line,"sample_values":fgvals,"subject":f"{g['away_abbr']} @ {g['home_abbr']}"})
 
+    # Full Game Moneyline: ganador del partido completo.
+    for side,abbr in [("away",g["away_abbr"]),("home",g["home_abbr"])]:
+        p0=sim_ml_prob(fgsim,side); lo,hi=_bands_from_sample_prob(p0,False,"medium")
+        items.append({"category":"Full Game","label":f"{abbr} ML Full Game","prob":p0,"prob_low":lo,"prob_high":hi,
+                      "agreement":.76,"quality":max(35,q-8),"confirmed":False,"volatility":"medium",
+                      "market_family":"fg_ml","side":side,"line":0.0,"sample_values":None,"subject":abbr})
+
     items.extend(build_prop_candidates_v7(away_pitch,home_pitch,g['away_pitcher_name'],g['home_pitcher_name'],away_lineup,home_lineup,both))
-    ranked=family_shortlist_v722(items,per_group=3)
+    ranked=family_shortlist_v722(items,per_group=8)
     for x in ranked:
         x["game"]=g["label"];x["game_pk"]=g["game_pk"];x["game_time_cdmx"]=format_game_time_cdmx(g.get("game_time_local"));x["data_quality"]=q;x["both_lineups_confirmed"]=both
         # Precio mínimo como referencia de modelo; no se presenta como cuota de sportsbook.
@@ -1852,10 +1859,10 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.2.2", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.2.2 Alpha")
-st.caption("V7.2.2: Express por familias + Pitcher K auditado + momios opcionales + contexto oculto + edición dentro del Top.")
-st.info("🧪 **V7.2.2 ALPHA** — Express ya no deja que Pitcher Ks monopolice el Top. Prioriza probabilidad conservadora, riesgo y calidad de datos; los momios son opcionales.")
+st.set_page_config(page_title="MLB Betting Hub V7.2.3", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.2.3 Alpha")
+st.caption("V7.2.3: Express por familias + Pitcher K auditado + momios opcionales + contexto oculto + edición dentro del Top.")
+st.info("🧪 **V7.2.3 ALPHA** — Express siempre muestra qué analizó: recomendados, cercanos y descartados. Full Game incluye ganador (Moneyline) y totales; los momios son opcionales.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -2054,7 +2061,7 @@ with st.expander("🔍 Ver contexto del partido seleccionado", expanded=False):
     st.caption(ready["advice"])
     if ready["reasons"]:
         st.caption("Pendiente: " + " · ".join(ready["reasons"]))
-    st.caption("V7.2.2 mejora la simulación de bateadores con perfil 1B/2B/3B/HR, OBP/SLG y splits disponibles. Statcast/Savant completo sigue pendiente de integración validada.")
+    st.caption("V7.2.3 mejora la simulación de bateadores con perfil 1B/2B/3B/HR, OBP/SLG y splits disponibles. Statcast/Savant completo sigue pendiente de integración validada.")
 
     current_context_snapshot=make_context_snapshot(
         game,away_pitch,home_pitch,away_lineup,home_lineup,weather,
@@ -2198,10 +2205,10 @@ with tab1:
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V7.2.2 separa probabilidad, confianza y riesgo; no ordena solo por porcentaje central.")
+    q3.caption("V7.2.3 separa probabilidad, confianza y riesgo; no ordena solo por porcentaje central.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V7.2.2 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V7.2.3 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
@@ -2329,7 +2336,7 @@ with tabExpress:
     lineup_mode=e2.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0)
     use_odds=e3.toggle("Usar momios de referencia",value=False,help="Apagado: elige por probabilidad, confianza y riesgo. Encendido: además valida el precio de mercado y consume créditos.")
     diversify=e4.checkbox("Diversificación automática",value=True,help="Ranking por familias. Pitcher Ks ya no puede monopolizar el Top.")
-    allowed_groups=st.multiselect("Mercados a incluir",["F5 / juego","Full Game","Pitcher props","Batter props"],default=["F5 / juego","Full Game","Pitcher props","Batter props"],help="Puedes quitar Pitcher props por completo si no quieres apuestas de pitchers.")
+    allowed_groups=st.multiselect("Mercados a incluir",["F5 / juego","Full Game","Pitcher props","Batter props"],default=["F5 / juego","Full Game","Pitcher props","Batter props"],help="F5 / juego incluye totales F5 y ganador F5. Full Game incluye totales y ganador Moneyline del partido completo. Puedes quitar cualquier familia.")
     max_per_game=st.slider("Máximo de selecciones por partido",1,3,1)
     st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si no hay calidad suficiente, devuelve menos picks; no rellena con pitchers.")
 
@@ -2383,7 +2390,12 @@ with tabExpress:
         qualified=[y for y in prepool if express_qualifies_v721(y,use_odds=use_odds)]
         qualified=sorted(qualified,key=lambda z:z.get("express_safety_score",-9),reverse=True)
         chosen=diversify_express_v721(qualified,target_n,max_per_game=max_per_game,automatic=diversify,allowed_groups=allowed_groups)
+        chosen_ids={(z.get("game_pk"),z.get("label")) for z in chosen}
+        near=[z for z in prepool if (z.get("game_pk"),z.get("label")) not in chosen_ids]
+        near=sorted(near,key=lambda z:z.get("express_safety_score",-9),reverse=True)[:max(8,target_n)]
         st.session_state["v7_express_results"]=chosen
+        st.session_state["v723_express_near"]=near
+        st.session_state["v723_express_stats"]={"markets":len(allp),"prepool":len(prepool),"qualified":len(qualified),"shown":len(chosen)}
         st.session_state["v721_use_odds"]=use_odds
         st.session_state["v72_express_lineup_mode"]=lineup_mode
         st.session_state["v722_allowed_groups"]=allowed_groups
@@ -2408,6 +2420,13 @@ with tabExpress:
         st.caption("🧠 The Odds API no está configurada; Express puede funcionar sin momios usando probabilidad + confianza + riesgo.")
 
     express=st.session_state.get("v7_express_results",[])
+    estats=st.session_state.get("v723_express_stats")
+    if estats:
+        q1,q2,q3,q4=st.columns(4)
+        q1.metric("Mercados generados",estats.get("markets",0))
+        q2.metric("Comparados",estats.get("prepool",0))
+        q3.metric("Calificaron",estats.get("qualified",0))
+        q4.metric("Top mostrado",estats.get("shown",0))
     if express:
         st.success(f"Top actual: {len(express)} oportunidades. Si pediste más y no aparecen, no hubo suficientes que calificaran.")
         gd={}
@@ -2468,7 +2487,17 @@ with tabExpress:
                                 st.rerun()
                     
     else:
-        st.info("Ejecuta Express. Puede devolver menos apuestas de las solicitadas si no hay suficientes con el nivel requerido.")
+        if estats:
+            st.warning("No hubo apuestas que alcanzaran el nivel 🟢 APOSTAR con estos filtros. Eso NO significa que Express no haya analizado.")
+            near=st.session_state.get("v723_express_near",[])
+            if near:
+                st.markdown("### 🟡 Mejores alternativas analizadas — todavía NO califican")
+                st.caption("Se muestran para que veas qué estuvo más cerca. No se convierten automáticamente en recomendación.")
+                for j,x in enumerate(near[:10],1):
+                    grp=market_group_v722(x)
+                    st.markdown(f"**{j}. {x.get('game','')} · {x.get('label','')}** — {grp} · Conservadora {x.get('prob_low',0)*100:.1f}% · Confianza {x.get('confidence_score',0)}/100")
+        else:
+            st.info("Ejecuta Express. Puede devolver menos apuestas de las solicitadas si no hay suficientes con el nivel requerido.")
 
 with tabParlay:
     st.subheader("🎟️ Constructor de Parlays — todos los juegos")
@@ -2582,7 +2611,7 @@ with tab2:
                     "timestamp":now_cdmx().strftime("%Y-%m-%d %H:%M:%S CDMX"),
                     "freeze_time_iso":now_cdmx().isoformat(timespec="seconds"),
                     "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,
-                    "model_version":"V7.2.2",
+                    "model_version":"V7.2.3",
                     "date":selected_date.isoformat(),
                     "game_pk":int(paper_choice.get("game_pk",0) or 0),
                     "game":paper_choice.get("game", pgame.get("label") if pgame else ""),
@@ -2809,6 +2838,6 @@ with tab5:
 
 st.divider()
 st.caption(
-    "V7.2.2 ALPHA. Alta probabilidad no significa apuesta segura. El objetivo es elevar selección y calibración, no prometer un porcentaje fijo de aciertos. "
+    "V7.2.3 ALPHA. Alta probabilidad no significa apuesta segura. El objetivo es elevar selección y calibración, no prometer un porcentaje fijo de aciertos. "
     "Paper Betting debe validar el modelo antes de aumentar riesgo real."
 )
