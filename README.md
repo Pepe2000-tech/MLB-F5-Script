@@ -1,6 +1,6 @@
-# MLB Betting Hub V7.6.4 Alpha — Paper Parlays completos
+# MLB Betting Hub V7.6.4.1 Alpha — Hotfix Evaluar Momios
 
-V7.6.4 corrige la estructura de Paper Betting para parlays.
+V7.6.4.1 mantiene Paper Parlays completos y corrige un KeyError en Evaluar momios cuando un candidato no trae el campo `label`. La interfaz ahora normaliza `label`, `market`, `subject`, lado y línea sin cambiar el modelo de apuestas.
 
 ## Cambio principal
 

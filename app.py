@@ -14,7 +14,7 @@ import streamlit as st
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.4"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.4.1"}
 CDMX_TZ=ZoneInfo("America/Mexico_City")
 
 def now_cdmx():
@@ -2413,7 +2413,7 @@ def build_paper_record_v762(item,odds,stake_mxn,selected_date,games,source="MANU
     pid=hashlib.sha1(f"{item.get('game_pk')}|{item.get('label')}|{source}|{stamp.isoformat()}".encode()).hexdigest()[:12]
     return {
         "paper_id":pid,"timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.4","date":selected_date.isoformat(),
+        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.4.1","date":selected_date.isoformat(),
         "game_pk":int(item.get("game_pk",0) or 0),"game":item.get("game",pgame.get("label") if pgame else ""),
         "game_time_cdmx":format_game_time_cdmx(pgame.get("game_time_local")) if pgame else "",
         "away_abbr":pgame.get("away_abbr","") if pgame else "","home_abbr":pgame.get("home_abbr","") if pgame else "",
@@ -2461,7 +2461,7 @@ def build_parlay_paper_record_v764(legs,stake_mxn,selected_date,games,parlay_ind
     return {
         "paper_id":gid,"record_type":"PARLAY","paper_source":"PARLAY","paper_group_id":gid,
         "timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "model_version":"V7.6.4","date":selected_date.isoformat(),"game_pk":0,
+        "model_version":"V7.6.4.1","date":selected_date.isoformat(),"game_pk":0,
         "game":f"Parlay {parlay_index} · {len(leg_records)} selecciones",
         "game_time_cdmx":"Varios juegos","away_abbr":"","home_abbr":"",
         "market":f"PARLAY {len(leg_records)} LEGS","category":"Parlay","market_family":"parlay",
@@ -2668,10 +2668,10 @@ def analyze_game_express_v7(g,selected_date,allowed_groups=None):
     return ranked,{"quality":q,"both":both,"statcast":sc_count>0,"statcast_count":sc_count,"statcast_coverage":sc_cov}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.6.4", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.6.4 Alpha")
-st.caption("V7.6.4: Paper Parlays completos + Multi-Parlay independiente + edición/recalculo total + Pre-Bet Hardening + Statcast/Savant + calibración.")
-st.info("🎟️ **V7.6.4 ALPHA — PAPER PARLAYS COMPLETOS** — Mantiene Statcast/Savant de V7.5 y añade puertas de calidad más estrictas antes de marcar un pick como APOSTAR. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
+st.set_page_config(page_title="MLB Betting Hub V7.6.4.1", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.6.4.1 Alpha")
+st.caption("V7.6.4.1: Paper Parlays completos + Multi-Parlay independiente + edición/recalculo total + Pre-Bet Hardening + Statcast/Savant + calibración.")
+st.info("🎟️ **V7.6.4.1 ALPHA — PAPER PARLAYS COMPLETOS** — Mantiene Statcast/Savant de V7.5 y añade puertas de calidad más estrictas antes de marcar un pick como APOSTAR. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -3358,9 +3358,9 @@ with tabExpress:
                 if x.get("reason"): st.caption("📌 "+x["reason"])
                 _gate=x.get("prebet_gate_v76") or prebet_quality_gate_v76(x,st.session_state.get("v721_use_odds",False))
                 if _gate.get("pass"):
-                    st.caption(f"🛡️ Gate V7.6.4: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
+                    st.caption(f"🛡️ Gate V7.6.4.1: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
                 else:
-                    st.caption("🛡️ Gate V7.6.4: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
+                    st.caption("🛡️ Gate V7.6.4.1: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
                 _cal=x.get("calibration_v75") or {}
                 if _cal.get("active"):
                     st.caption(f"🎯 Calibración histórica activa: N={_cal.get('n')} · ajuste {float(_cal.get('delta',0))*100:+.1f} pp (limitado y regresado).")
@@ -3442,7 +3442,7 @@ with tabParlay:
     parlay_use_odds=po2.toggle("Usar momios de referencia",value=False,key="v763_parlay_use_odds",help="Si está apagado, Mayor ganancia usa el momio mínimo orientativo del modelo. Si está encendido, intenta usar cuotas de referencia y puede consumir créditos de The Odds API.")
 
     if parlay_profile=="Menor riesgo":
-        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.4. Si no alcanza la calidad, puede entregar menos parlays o menos piernas.")
+        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.4.1. Si no alcanza la calidad, puede entregar menos parlays o menos piernas.")
     elif parlay_profile=="Equilibrado":
         st.info("⚖️ Equilibrado: combina probabilidad/solidez con una cuota razonable. Puede usar picks amarillos fuertes para completar tickets, siempre identificados como riesgo.")
     else:
@@ -3690,11 +3690,41 @@ with tab2:
     if not source_candidates:
         st.info("Primero ejecuta **⚡ Express** o analiza un partido individual.")
     else:
+        # Hotfix V7.6.4.1: algunos candidatos nuevos pueden traer `market`/`subject`
+        # en lugar de `label`. Normalizamos el texto antes de pintar la UI para
+        # evitar KeyError sin cambiar el modelo ni la evaluación de momios.
+        def _eval_market_label(x):
+            label=x.get("label") or x.get("market")
+            if label:
+                return str(label)
+            subject=str(x.get("subject") or "Mercado")
+            fam=str(x.get("market_family") or x.get("category") or "")
+            side=str(x.get("side") or "").strip()
+            line=x.get("line")
+            parts=[subject]
+            if side:
+                parts.append(side)
+            if line is not None:
+                try:
+                    parts.append(f"{float(line):g}")
+                except Exception:
+                    parts.append(str(line))
+            if fam and fam.lower() not in subject.lower():
+                parts.append(fam)
+            return " ".join(z for z in parts if z).strip() or "Mercado"
+
+        normalized_candidates=[]
+        for x in source_candidates:
+            y=dict(x)
+            y["label"]=_eval_market_label(y)
+            normalized_candidates.append(y)
+        source_candidates=normalized_candidates
+
         labels=[x["label"] for x in source_candidates]
         selected=st.multiselect("¿Cuáles quieres revisar con el momio de Draftea?",labels,default=labels,key="v721_eval_selected")
         evaluated=[]
         for idx,label in enumerate(selected):
-            item=next(x for x in source_candidates if x["label"]==label)
+            item=next(x for x in source_candidates if x.get("label")==label)
             default_od=float(item.get("draftea_odds") or item.get("reference_odds") or 1.80)
             target=1.05/max(float(item.get("prob_low",item.get("prob",.5))),.01)
             c1,c2,c3=st.columns([2.3,1,1])
@@ -3714,9 +3744,9 @@ with tab2:
             st.markdown("### Resultado")
             best=evaluated[0]
             if best["verdict"]=="APOSTAR":
-                st.success(f"🟢 MEJOR OPCIÓN ACTUAL: {best['game']} · {best['label']} @ {best['odds']:.2f}x")
+                st.success(f"🟢 MEJOR OPCIÓN ACTUAL: {best.get('game','')} · {_eval_market_label(best)} @ {best['odds']:.2f}x")
             elif best["verdict"]=="CANDIDATO":
-                st.warning(f"🟡 MEJOR CANDIDATO: {best['game']} · {best['label']} @ {best['odds']:.2f}x")
+                st.warning(f"🟡 MEJOR CANDIDATO: {best.get('game','')} · {_eval_market_label(best)} @ {best['odds']:.2f}x")
             else:
                 st.info("⚪ PASS GENERAL — con estos momios ninguna selección compensa suficientemente el riesgo.")
 
@@ -3724,14 +3754,14 @@ with tab2:
                 icon="🟢" if x["verdict"]=="APOSTAR" else "🟡" if x["verdict"]=="CANDIDATO" else "⚪"
                 edited=" · ✏️ línea ajustada en Express" if x.get("manual_line_edited") else ""
                 st.write(
-                    f"**{i}. {icon} {x['game']} · {x['label']} @ {x['odds']:.2f}x** — "
+                    f"**{i}. {icon} {x.get('game','')} · {_eval_market_label(x)} @ {x['odds']:.2f}x** — "
                     f"Central {x['prob']*100:.1f}% | Conservadora {x['prob_low']*100:.1f}% | "
                     f"Conf. {x.get('confidence_score',0)}/100 | Riesgo {x.get('risk_icon','')} {x.get('risk_label','')} | "
                     f"EV cons. {x['ev_cons']*100:+.1f}% | **{x['verdict']}**{edited}"
                 )
 
             st.markdown("### 🧪 Guardar en Paper Betting")
-            paper_labels=[f"{x['game']} · {x['label']}" for x in evaluated]
+            paper_labels=[f"{x.get('game','')} · {_eval_market_label(x)}" for x in evaluated]
             paper_label=st.selectbox("Selección a registrar",paper_labels,key="paper_market_v721")
             paper_choice=evaluated[paper_labels.index(paper_label)]
             stake_mxn=st.number_input("Monto simulado (MXN)",min_value=5.0,max_value=10000.0,value=50.0,step=5.0,key="paper_stake_mxn_v721")
@@ -3744,7 +3774,7 @@ with tab2:
             st.caption(f"Lineups al guardar: {'✅ completos' if both_ok else '⚠️ pendientes'} · estado {freeze_level}")
 
             if st.button("🧊 Congelar y registrar Paper Bet",type="primary",key="freeze_paper_v721"):
-                pid=hashlib.sha1(f"{paper_choice.get('game_pk')}|{paper_choice['label']}|{now_cdmx().isoformat()}".encode()).hexdigest()[:10]
+                pid=hashlib.sha1(f"{paper_choice.get('game_pk')}|{_eval_market_label(paper_choice)}|{now_cdmx().isoformat()}".encode()).hexdigest()[:10]
                 rec={
                     "paper_id":pid,
                     "timestamp":now_cdmx().strftime("%Y-%m-%d %H:%M:%S CDMX"),
@@ -3757,7 +3787,7 @@ with tab2:
                     "game_time_cdmx":format_game_time_cdmx(pgame.get("game_time_local")) if pgame else "",
                     "away_abbr":pgame.get("away_abbr","") if pgame else "",
                     "home_abbr":pgame.get("home_abbr","") if pgame else "",
-                    "market":paper_choice["label"],
+                    "market":_eval_market_label(paper_choice),
                     "category":paper_choice.get("category",""),
                     "odds":round(float(paper_choice["odds"]),3),
                     "stake":round(float(stake_mxn/50.0),4),
