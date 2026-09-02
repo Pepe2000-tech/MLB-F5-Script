@@ -1,25 +1,24 @@
-# MLB Betting Hub V7.2.5 Alpha
+# MLB Betting Hub V7.6 Alpha — Pre-Bet Hardening
 
-V7.2.5 hace que Express permita elegir mercados concretos en lugar de agruparlos de forma ambigua.
+V7.6 toma V7.5 como base y añade una capa de control de calidad antes de etiquetar una selección como **APOSTAR**.
 
-## Cambios de V7.2.5
-- **F5 Carreras**: Express analiza únicamente Over/Under de carreras en las primeras 5 entradas. F5 Moneyline deja de formar parte de Express.
-- **Full Game ML**: opción independiente para buscar al ganador del partido completo.
-- **Full Game Carreras**: opción independiente para buscar Over/Under de carreras del juego completo.
-- **Pitcher Ks** y **Batter props** siguen disponibles, pero son opcionales.
-- Por defecto Express arranca con **F5 Carreras + Full Game ML + Full Game Carreras**, evitando que props de pitchers aparezcan si el usuario no los activa.
-- La diversificación y el máximo de selecciones por partido continúan respetándose.
-- Si Full Game ML está activado, se mantiene la vista **Ganador con mayor probabilidad por partido**.
-- Si no hay suficientes verdes, Express puede mostrar las mejores alternativas con riesgo claramente identificado.
-- Momios de referencia siguen siendo opcionales.
-- La edición de línea dentro de Express sigue pasando la selección ajustada a **Evaluar momios**.
+## Qué cambia
 
-## Flujo recomendado
-1. Selecciona lineups completos o pendientes.
-2. Elige los mercados exactos que quieres analizar.
-3. Decide si deseas usar momios de referencia.
-4. Ejecuta Express.
-5. Edita una línea dentro de la propia tarjeta si Draftea ofrece otra.
-6. Revisa la selección ajustada en Evaluar momios.
+- Gate final de calidad por mercado.
+- Exige lineups confirmados para un verde estricto.
+- Penaliza calidad de datos baja e intervalos de incertidumbre amplios.
+- Usa confiabilidad del mercado y Bet Quality como requisitos, no solo como información visual.
+- Hits, Total Bases y Home Run requieren cobertura Statcast suficiente para recibir verde estricto.
+- Home Run tiene reglas más duras por su varianza natural.
+- Pitcher Ks requiere una confianza mínima más alta.
+- Si se activan momios, una selección sin referencia compatible o con PASS no puede ser verde.
+- Express sigue excluyendo juegos Live/Final y vuelve a consultar lineups en cada búsqueda.
+- Los picks que no pasan el gate siguen pudiendo mostrarse como **REVISAR / CON RIESGO**, pero no se confunden con APOSTAR.
 
-La aplicación no garantiza resultados ni apuestas seguras; prioriza probabilidad, confianza y riesgo y puede marcar alternativas cuando ninguna opción alcanza el umbral de recomendación.
+## Filosofía
+
+V7.6 no intenta inflar probabilidades ni producir más picks verdes. Busca reducir falsos verdes y hacer que una recomendación pregame tenga suficientes datos detrás.
+
+## Importante
+
+Sigue siendo una versión Alpha. Statcast/Savant puede no estar disponible para todos los jugadores o consultas; cuando falla, el modelo conserva el fallback MLB. Esto no sustituye backtesting ni calibración con una muestra amplia de Paper Bets.
