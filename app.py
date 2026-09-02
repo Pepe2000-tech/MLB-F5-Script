@@ -11,11 +11,10 @@ import itertools
 import requests
 import numpy as np
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/7.1.1"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/7.2"}
 CDMX_TZ=ZoneInfo("America/Mexico_City")
 
 def now_cdmx():
@@ -30,8 +29,29 @@ def _secret(name, default=None):
     except Exception:
         return default
 
+LOCAL_PAPER_STORE=os.getenv("MLB_PAPER_STORE","/tmp/mlb_betting_hub_v72_paper_bets.json")
+
 def persistent_store_enabled():
     return bool(_secret("SUPABASE_URL") and _secret("SUPABASE_KEY"))
+
+def _local_load_paper_bets():
+    try:
+        if not os.path.exists(LOCAL_PAPER_STORE): return []
+        with open(LOCAL_PAPER_STORE,"r",encoding="utf-8") as f:
+            rows=json.load(f)
+        return rows if isinstance(rows,list) else []
+    except Exception:
+        return []
+
+def _local_write_paper_bets(rows):
+    try:
+        tmp=LOCAL_PAPER_STORE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f:
+            json.dump(rows,f,ensure_ascii=False,default=str)
+        os.replace(tmp,LOCAL_PAPER_STORE)
+        return True
+    except Exception:
+        return False
 
 def _supabase_headers(prefer=False):
     key=_secret("SUPABASE_KEY")
@@ -42,22 +62,33 @@ def _supabase_headers(prefer=False):
 
 def persistent_load_paper_bets():
     if not persistent_store_enabled():
-        return []
+        return _local_load_paper_bets()
     try:
         url=_secret("SUPABASE_URL").rstrip("/")+"/rest/v1/mlb_paper_bets"
         r=requests.get(url,params={"select":"payload","order":"created_at.asc"},headers=_supabase_headers(),timeout=12)
         r.raise_for_status()
-        return [x.get("payload",{}) for x in r.json() if isinstance(x.get("payload"),dict)]
+        rows=[x.get("payload",{}) for x in r.json() if isinstance(x.get("payload"),dict)]
+        _local_write_paper_bets(rows)
+        return rows
     except Exception:
-        return []
+        return _local_load_paper_bets()
 
 def persistent_upsert_paper_bet(record):
+    # Always persist locally first so F5/reruns do not erase the ticket on the same Streamlit instance.
+    rows=_local_load_paper_bets()
+    pid=str(record.get("paper_id"))
+    replaced=False
+    for i,row in enumerate(rows):
+        if str(row.get("paper_id"))==pid:
+            rows[i]=record; replaced=True; break
+    if not replaced: rows.append(record)
+    local_ok=_local_write_paper_bets(rows)
     if not persistent_store_enabled():
-        return False
+        return local_ok
     try:
         url=_secret("SUPABASE_URL").rstrip("/")+"/rest/v1/mlb_paper_bets"
         payload={
-            "paper_id":str(record.get("paper_id")),
+            "paper_id":pid,
             "created_at":record.get("freeze_time_iso") or now_cdmx().isoformat(),
             "payload":record,
         }
@@ -65,18 +96,18 @@ def persistent_upsert_paper_bet(record):
         r.raise_for_status()
         return True
     except Exception:
-        return False
+        return local_ok
 
 def persistent_delete_all_paper_bets():
-    if not persistent_store_enabled():
-        return False
+    local_ok=_local_write_paper_bets([])
+    if not persistent_store_enabled(): return local_ok
     try:
         url=_secret("SUPABASE_URL").rstrip("/")+"/rest/v1/mlb_paper_bets"
         r=requests.delete(url,params={"paper_id":"not.is.null"},headers=_supabase_headers(True),timeout=12)
         r.raise_for_status()
         return True
     except Exception:
-        return False
+        return local_ok
 
 
 # ================= V7 MOMIOS DE REFERENCIA =================
@@ -196,29 +227,75 @@ def reference_quote_from_event(item,event_odds):
     }
 
 def enrich_candidates_reference_odds(candidates,games_list):
-    """Añade consenso de mercado sólo a candidatos preseleccionados, agrupando consultas por juego."""
+    """Añade consenso de mercado y obliga a evaluar EXACTAMENTE la línea encontrada por la API."""
     if not odds_api_enabled():return candidates,{"enabled":False}
     events,usage0=odds_api_events(); out=[dict(x) for x in candidates]
     by_pk={g.get("game_pk"):g for g in games_list}; groups={}
     for i,x in enumerate(out):
         g=by_pk.get(x.get("game_pk")); ev=odds_event_for_game(g,events) if g else None; mk=_odds_market_key(x)
-        if ev and mk: groups.setdefault((x.get("game_pk"),ev.get("id")),{"markets":set(),"idx":[]})["markets"].add(mk);groups[(x.get("game_pk"),ev.get("id"))]["idx"].append(i)
+        if ev and mk:
+            key=(x.get("game_pk"),ev.get("id"))
+            groups.setdefault(key,{"markets":set(),"idx":[]})["markets"].add(mk)
+            groups[key]["idx"].append(i)
     last_usage=usage0
     for (gpk,eid),meta in groups.items():
         data,u=odds_api_event_odds(eid,",".join(sorted(meta["markets"])))
         if u:last_usage=u
         for i in meta["idx"]:
-            q=reference_quote_from_event(out[i],data)
+            original=dict(out[i])
+            q=reference_quote_from_event(original,data)
             if not q:continue
-            out[i]["reference_quote"]=q;out[i]["reference_odds"]=q["median"];out[i]["reference_best_odds"]=q["best"]
-            out[i]["reference_line"]=q["line"];out[i]["reference_books"]=q["books"];out[i]["reference_best_book"]=q["best_book"]
-            # Si el mercado ofrece otra línea, el modelo se recalcula sobre ESA línea antes de evaluar el precio.
-            priced=out[i]
-            if priced.get("sample_values") is not None and abs(float(q["line"])-float(priced.get("line",q["line"])))>.001:
-                rp=v7_reprice_line(priced,q["line"],priced.get("side","over"))
-                if rp:priced=rp
-            pm=v7_price_metrics(priced,q["median"]);out[i]["reference_model_prob"]=priced.get("prob");out[i]["reference_model_low"]=priced.get("prob_low")
-            out[i]["reference_ev_cons"]=pm["ev_cons"];out[i]["reference_verdict"]=pm["verdict"];out[i]["reference_target_odds"]=pm["target"]
+
+            original_line=float(original.get("line",q["line"]) or q["line"])
+            market_line=float(q["line"])
+            line_changed=abs(market_line-original_line)>.001
+            priced=original
+
+            # Regla V7.1.3: jamás usar la probabilidad de una línea para valorar otra.
+            if line_changed:
+                if original.get("sample_values") is None:
+                    out[i].update({
+                        "reference_quote":q,"reference_odds":q["median"],"reference_best_odds":q["best"],
+                        "reference_line":market_line,"reference_books":q["books"],"reference_best_book":q["best_book"],
+                        "original_model_line":original_line,"original_model_label":original.get("label"),
+                        "line_repriced":False,"reference_verdict":"NO EVALUABLE","reference_ev_cons":None,
+                    })
+                    continue
+                rp=v7_reprice_line(original,market_line,original.get("side","over"))
+                if not rp:
+                    out[i].update({
+                        "reference_quote":q,"reference_odds":q["median"],"reference_best_odds":q["best"],
+                        "reference_line":market_line,"reference_books":q["books"],"reference_best_book":q["best_book"],
+                        "original_model_line":original_line,"original_model_label":original.get("label"),
+                        "line_repriced":False,"reference_verdict":"NO EVALUABLE","reference_ev_cons":None,
+                    })
+                    continue
+                priced=rp
+
+            # Sustituimos la selección por la versión recalculada para que etiqueta, probabilidad,
+            # conservadora, momio mínimo y EV correspondan TODOS a la misma línea.
+            if line_changed:
+                priced["original_model_line"]=original_line
+                priced["original_model_label"]=original.get("label")
+                priced["line_repriced"]=True
+            else:
+                priced["line_repriced"]=False
+
+            priced["reference_quote"]=q
+            priced["reference_odds"]=q["median"]
+            priced["reference_best_odds"]=q["best"]
+            priced["reference_line"]=market_line
+            priced["reference_books"]=q["books"]
+            priced["reference_best_book"]=q["best_book"]
+            priced["reference_price_quality"]="FUERTE" if q["books"]>=3 else "MEDIA" if q["books"]==2 else "LIMITADA"
+            pm=v7_price_metrics(priced,q["median"])
+            priced["reference_model_prob"]=priced.get("prob")
+            priced["reference_model_low"]=priced.get("prob_low")
+            priced["reference_ev_cons"]=pm["ev_cons"]
+            priced["reference_verdict"]=pm["verdict"]
+            priced["reference_target_odds"]=pm["target"]
+            priced["model_target_odds"]=pm["target"]
+            out[i]=priced
     return out,{"enabled":True,**(last_usage or {})}
 
 
@@ -282,6 +359,9 @@ def get_schedule(date_str):
                 "away_pitcher_name":app.get("fullName","TBD"),
                 "home_pitcher_name":hpp.get("fullName","TBD"),
                 "label":f"{aa} @ {ha}","game_time_local":g.get("gameDate"),
+                "abstract_state":(g.get("status") or {}).get("abstractGameState",""),
+                "detailed_state":(g.get("status") or {}).get("detailedState",""),
+                "status_code":(g.get("status") or {}).get("statusCode",""),
             })
     return out
 
@@ -462,112 +542,6 @@ def get_lineups(game_pk):
     return result
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def get_live_scoreboard(game_pk):
-    """Estado LIVE de MLB para visualización. No modifica el modelo pregame."""
-    if not game_pk:
-        return {"error":"gamePk no disponible"}
-    try:
-        # IMPORTANTE: feed/live vive en StatsAPI v1.1, no en /api/v1.
-        feed=_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
-        gd=feed.get("gameData",{})
-        ld=feed.get("liveData",{})
-        status=(gd.get("status") or {})
-        linescore=ld.get("linescore") or {}
-        teams=linescore.get("teams") or {}
-        offense=linescore.get("offense") or {}
-        defense=linescore.get("defense") or {}
-        plays=ld.get("plays") or {}
-        current_play=plays.get("currentPlay") or {}
-        play_count=current_play.get("count") or {}
-        result=current_play.get("result") or {}
-        about=current_play.get("about") or {}
-
-        balls=play_count.get("balls", linescore.get("balls",0))
-        strikes=play_count.get("strikes", linescore.get("strikes",0))
-        outs=play_count.get("outs", linescore.get("outs",0))
-        inning=linescore.get("currentInning") or about.get("inning")
-        half=linescore.get("inningHalf") or linescore.get("halfInning") or about.get("halfInning") or ""
-
-        def runner(base_key):
-            x=offense.get(base_key) or {}
-            return bool(x.get("id") or x.get("fullName"))
-
-        batter=offense.get("batter") or {}
-        pitcher=defense.get("pitcher") or {}
-        matchup=current_play.get("matchup") or {}
-        if not batter:
-            batter=(matchup.get("batter") or {})
-        if not pitcher:
-            pitcher=(matchup.get("pitcher") or {})
-
-        pitch_count=None
-        try:
-            box=(ld.get("boxscore") or {}).get("teams") or {}
-            pid=pitcher.get("id")
-            for side in ("away","home"):
-                pd=(box.get(side) or {}).get("players",{}).get(f"ID{pid}",{}) if pid else {}
-                if pd:
-                    ps=(pd.get("stats") or {}).get("pitching") or {}
-                    pitch_count=ps.get("numberOfPitches")
-                    if pitch_count is not None: break
-        except Exception:
-            pitch_count=None
-
-        return {
-            "abstract":status.get("abstractGameState","Preview"),
-            "coded":status.get("codedGameState",""),
-            "detailed":status.get("detailedState",""),
-            "inning":inning,"half":half,
-            "away_runs":int((teams.get("away") or {}).get("runs") or 0),
-            "home_runs":int((teams.get("home") or {}).get("runs") or 0),
-            "away_hits":int((teams.get("away") or {}).get("hits") or 0),
-            "home_hits":int((teams.get("home") or {}).get("hits") or 0),
-            "away_errors":int((teams.get("away") or {}).get("errors") or 0),
-            "home_errors":int((teams.get("home") or {}).get("errors") or 0),
-            "balls":int(balls or 0),"strikes":int(strikes or 0),"outs":int(outs or 0),
-            "on_first":runner("first"),"on_second":runner("second"),"on_third":runner("third"),
-            "batter":batter.get("fullName","N/D"),"pitcher":pitcher.get("fullName","N/D"),
-            "pitch_count":pitch_count,
-            "last_play":result.get("description") or result.get("event") or "",
-        }
-    except Exception as e:
-        return {"error":f"{type(e).__name__}: {e}"}
-
-def render_live_scoreboard(game):
-    live=get_live_scoreboard(game.get("game_pk"))
-    if not live or live.get("error"):
-        st.warning("No pude leer el feed LIVE de MLB para este partido.")
-        if live and live.get("error"):
-            with st.expander("Ver detalle técnico"):
-                st.code(live.get("error"))
-        return
-    state=live["abstract"]
-    if state=="Live":
-        status=f"🔴 EN VIVO · {live.get('half','')} {live.get('inning') or ''}"
-    elif state=="Final":
-        status="🏁 FINAL"
-    else:
-        status=f"🕒 {live.get('detailed') or 'PRÓXIMAMENTE'}"
-    st.markdown(f"### {status}")
-    a,b,c=st.columns([1.2,.8,1.2])
-    a.markdown(f"## {game['away_abbr']}  **{live['away_runs']}**")
-    b.markdown("## —")
-    c.markdown(f"## **{live['home_runs']}**  {game['home_abbr']}")
-    if state=="Live":
-        base1="◆" if live['on_first'] else "◇"
-        base2="◆" if live['on_second'] else "◇"
-        base3="◆" if live['on_third'] else "◇"
-        st.markdown(f"<div style='text-align:center;font-size:26px'>{base2}<br>{base3}&nbsp;&nbsp;&nbsp;&nbsp;{base1}</div>",unsafe_allow_html=True)
-        st.markdown(f"<div style='text-align:center'><b>{live['balls']}-{live['strikes']} · {live['outs']} outs</b></div>",unsafe_allow_html=True)
-        x,y=st.columns(2)
-        pc=f" · {live['pitch_count']} lanzamientos" if live.get('pitch_count') is not None else ""
-        x.caption(f"⚾ Pitcher: {live['pitcher']}{pc}")
-        y.caption(f"🏏 Bateador: {live['batter']}")
-        if live.get("last_play"):
-            st.info(f"Última jugada: {live['last_play']}")
-    st.caption(f"R/H/E · {game['away_abbr']} {live['away_runs']}/{live['away_hits']}/{live['away_errors']} · {game['home_abbr']} {live['home_runs']}/{live['home_hits']}/{live['home_errors']} · refresco automático ~30 s")
-
 def _f(v,d=0.0):
     try:return float(v)
     except:return d
@@ -585,10 +559,11 @@ def get_hitter_stats(player_id,season,opposing_hand="R"):
             s=splits[0].get("stat",{})
             pa=int(s.get("plateAppearances",0) or 0)
             overall={
-                "ops":_f(s.get("ops"),.720),"pa":pa,"ab":int(s.get("atBats",0) or 0),
-                "hits":int(s.get("hits",0) or 0),"hr":int(s.get("homeRuns",0) or 0),
+                "ops":_f(s.get("ops"),.720),"avg":_f(s.get("avg"),.250),"obp":_f(s.get("obp"),.320),"slg":_f(s.get("slg"),.400),
+                "pa":pa,"ab":int(s.get("atBats",0) or 0),
+                "hits":int(s.get("hits",0) or 0),"doubles":int(s.get("doubles",0) or 0),"triples":int(s.get("triples",0) or 0),"hr":int(s.get("homeRuns",0) or 0),
                 "runs":int(s.get("runs",0) or 0),"rbi":int(s.get("rbi",0) or 0),
-                "tb":int(s.get("totalBases",0) or 0),"so":int(s.get("strikeOuts",0) or 0)
+                "tb":int(s.get("totalBases",0) or 0),"so":int(s.get("strikeOuts",0) or 0),"bb":int(s.get("baseOnBalls",0) or 0)
             }
     except Exception:pass
 
@@ -606,15 +581,17 @@ def get_hitter_stats(player_id,season,opposing_hand="R"):
     except Exception:split=None
 
     if not overall:
-        return {"ops":.720,"pa":0,"hits":0,"hr":0,"runs":0,"rbi":0,"tb":0,"so":0,
-                "hit_rate":.22,"hr_rate":.03,"tb_rate":.32,"hrr_rate":.42,"k_rate":.22,
+        return {"ops":.720,"avg":.250,"obp":.320,"slg":.400,"pa":0,"hits":0,"doubles":0,"triples":0,"hr":0,"runs":0,"rbi":0,"tb":0,"so":0,"bb":0,
+                "hit_rate":.22,"single_rate":.145,"double_rate":.045,"triple_rate":.004,"hr_rate":.03,"tb_rate":.32,"hrr_rate":.42,"k_rate":.22,"bb_rate":.08,"iso":.150,
                 "used_split":False,"stats_available":False}
 
     pa=max(overall["pa"],1)
     ops=split["ops"] if split and split["pa"]>=30 else overall["ops"]
-    return {**overall,"ops":ops,
-            "hit_rate":overall["hits"]/pa,"hr_rate":overall["hr"]/pa,"tb_rate":overall["tb"]/pa,
-            "hrr_rate":(overall["hits"]+overall["runs"]+overall["rbi"])/pa,"k_rate":overall["so"]/pa,
+    singles=max(0,overall["hits"]-overall["doubles"]-overall["triples"]-overall["hr"])
+    return {**overall,"ops":ops,"iso":max(0.0,overall.get("slg",.400)-overall.get("avg",.250)),
+            "hit_rate":overall["hits"]/pa,"single_rate":singles/pa,"double_rate":overall["doubles"]/pa,"triple_rate":overall["triples"]/pa,
+            "hr_rate":overall["hr"]/pa,"tb_rate":overall["tb"]/pa,
+            "hrr_rate":(overall["hits"]+overall["runs"]+overall["rbi"])/pa,"k_rate":overall["so"]/pa,"bb_rate":overall["bb"]/pa,
             "used_split":bool(split and split["pa"]>=30),"stats_available":True}
 
 def enrich_lineup(lineup,season,opposing_hand):
@@ -1095,19 +1072,26 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
             split_adj=clamp(float(p.get("ops",LEAGUE_OPS))/LEAGUE_OPS,.88,1.12)
             rng=np.random.default_rng(stable_seed(p['name'],"HITTER-V7"))
 
-            hit_rate=shrink_mean(clamp(float(p.get("hit_rate",LEAGUE_HIT_PA))*split_adj,0,.60),sample,LEAGUE_HIT_PA,120)
+            # V7.2: simulate PA outcomes (1B/2B/3B/HR/out) instead of a Poisson shortcut for total bases.
             npa=max(1,int(round(pa)))
-            hits=rng.binomial(npa,hit_rate,size=14000)
+            pr_single=shrink_mean(clamp(float(p.get("single_rate",.145))*split_adj,0,.35),sample,.145,140)
+            pr_double=shrink_mean(clamp(float(p.get("double_rate",.045))*split_adj,0,.16),sample,.045,160)
+            pr_triple=shrink_mean(clamp(float(p.get("triple_rate",.004))*split_adj,0,.04),sample,.004,220)
+            pr_hr=shrink_mean(clamp(float(p.get("hr_rate",LEAGUE_HR_PA))*split_adj,0,.18),sample,LEAGUE_HR_PA,180)
+            total_hit=pr_single+pr_double+pr_triple+pr_hr
+            if total_hit>.62:
+                scale=.62/total_hit; pr_single*=scale; pr_double*=scale; pr_triple*=scale; pr_hr*=scale
+            probs=np.array([max(0,1-(pr_single+pr_double+pr_triple+pr_hr)),pr_single,pr_double,pr_triple,pr_hr],dtype=float)
+            probs=probs/probs.sum()
+            draws=rng.choice(5,size=(14000,npa),p=probs)
+            hits=np.sum(draws>0,axis=1)
+            tbs=np.sum(np.where(draws==1,1,np.where(draws==2,2,np.where(draws==3,3,np.where(draws==4,4,0)))),axis=1)
+            hrs=np.sum(draws==4,axis=1)
 
-            tb_rate=shrink_mean(clamp(float(p.get("tb_rate",LEAGUE_TB_PA))*split_adj,0,1.1),sample,LEAGUE_TB_PA,130)
-            # Poisson game-TB approximation; V7 stores uncertainty explicitly.
-            tbs=rng.poisson(max(.05,tb_rate*pa),size=14000)
-
-            hrr_rate=shrink_mean(clamp(float(p.get("hrr_rate",.42))*split_adj,0,1.5),sample,.42,150)
+            # HRR remains an event-count approximation, but it now uses OBP/SLG as a bounded quality-of-offense modifier.
+            quality_adj=clamp((float(p.get("obp",.320))/.320)*.45 + (float(p.get("slg",.400))/.400)*.55,.82,1.18)
+            hrr_rate=shrink_mean(clamp(float(p.get("hrr_rate",.42))*split_adj*quality_adj,0,1.5),sample,.42,170)
             hrr=rng.poisson(max(.05,hrr_rate*pa),size=14000)
-
-            hr_rate=shrink_mean(clamp(float(p.get("hr_rate",LEAGUE_HR_PA))*split_adj,0,.18),sample,LEAGUE_HR_PA,180)
-            hrs=rng.binomial(npa,hr_rate,size=14000)
 
             specs=[
                 ("Hits", "hits", hits,[.5,1.5],"low"),
@@ -1125,7 +1109,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
                             "agreement":.90 if confirmed else .72,"quality":q if vol!="high" else max(55,q-12),
                             "confirmed":confirmed,"volatility":vol,"market_family":fam,"side":side,"line":line,
                             "subject":p['name'],"sample_values":vals,
-                            "reason":f"V7 O/U · ~{pa:.1f} PA · turno #{p['order']} · tasa regresada y distribución de juego."
+                            "reason":f"V7.2 O/U · ~{pa:.1f} PA · turno #{p['order']} · perfil 1B/2B/3B/HR + OPS/OBP/SLG regresado."
                         })
     hitters(away_lineup);hitters(home_lineup)
     return props
@@ -1439,7 +1423,7 @@ def context_changes(previous, current):
 
 @st.cache_data(ttl=60)
 def get_game_result_v65(game_pk):
-    """Resultado final + F5 + stats individuales desde MLB live feed."""
+    """Resultado final + F5 + stats individuales desde el feed oficial de juego de MLB para liquidar Paper Bets."""
     if not game_pk:
         return {"available":False,"final":False}
     try:
@@ -1675,6 +1659,107 @@ def readiness_verdict_icon(verdict):
         "NO CERRAR":"🔴",
     }.get(verdict,"⚪")
 
+
+# ================= V7.2 DECISION / EXPRESS HELPERS =================
+def game_start_cdmx(g):
+    try:
+        raw=g.get("game_time_local")
+        if not raw: return None
+        dt=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+        return dt.astimezone(CDMX_TZ)
+    except Exception:
+        return None
+
+def game_is_pregame(g,now=None):
+    now=now or now_cdmx()
+    state=str(g.get("abstract_state") or "").lower()
+    code=str(g.get("status_code") or "").upper()
+    if state in ("live","final") or code in ("I","F","O"):
+        return False
+    if state in ("preview","pregame"):
+        return True
+    # Fallback only when MLB did not provide a useful state.
+    start=game_start_cdmx(g)
+    return bool(start is None or start>now)
+
+def risk_profile_v72(item):
+    low=float(item.get("prob_low",item.get("prob",.5)))
+    conf=float(item.get("confidence_score",confidence_score(item)))
+    width=float(item.get("prob_high",item.get("prob",.5)))-low
+    vol=item.get("volatility","medium")
+    confirmed=bool(item.get("confirmed",False))
+    penalty=0
+    if vol=="high": penalty+=2
+    elif vol=="medium": penalty+=1
+    if not confirmed: penalty+=1
+    if width>.15: penalty+=1
+    if low>=.66 and conf>=72 and penalty<=1: return "BAJO","🟢"
+    if low>=.58 and conf>=58 and penalty<=2: return "MEDIO","🟡"
+    return "ALTO","🟠"
+
+def express_objective_score_v72(item,objective):
+    low=float(item.get("prob_low",item.get("prob",.5)))
+    conf=float(item.get("confidence_score",confidence_score(item)))/100
+    width=max(0,float(item.get("prob_high",item.get("prob",.5)))-low)
+    risk_pen={"low":0.0,"medium":.025,"high":.075}.get(item.get("volatility","medium"),.03)
+    evc=float(item.get("reference_ev_cons",0) or 0)
+    has_price=bool(item.get("reference_odds"))
+    if objective=="🛡️ Alta probabilidad":
+        # Price informs the card but is not the gate. Focus on conservative hit probability and stability.
+        return low*.62+conf*.30-width*.18-risk_pen
+    if objective=="💰 Mejor valor":
+        return (evc*.48 if has_price else -.18)+low*.25+conf*.22-width*.12-risk_pen
+    # Balanced
+    return low*.42+conf*.27+(evc*.22 if has_price else 0)-width*.14-risk_pen
+
+def express_qualifies_v72(item,objective):
+    low=float(item.get("prob_low",item.get("prob",.5)))
+    conf=float(item.get("confidence_score",confidence_score(item)))
+    verdict=item.get("reference_verdict")
+    if objective=="🛡️ Alta probabilidad":
+        return low>=.61 and conf>=62 and item.get("volatility")!="high"
+    if objective=="💰 Mejor valor":
+        return bool(item.get("reference_odds")) and verdict in ("APOSTAR","CANDIDATO") and low>=.53 and conf>=48
+    if item.get("reference_odds"):
+        return low>=.56 and conf>=55 and verdict!="PASS"
+    return low>=.59 and conf>=58
+
+def diversify_express_v72(pool,target_n,max_per_game=1,automatic=True):
+    selected=[]; game_counts={}; family_counts={}; player_counts={}
+    if not automatic:
+        return pool[:target_n]
+    # Soft caps: do not let player props crowd out game markets, but never insert a weak pick just for variety.
+    prop_cap=max(2,math.ceil(target_n*.45))
+    props=0
+    game_market_fams={"f5_total","fg_total","f5_ml","fg_ml","team_total"}
+    for x in pool:
+        if game_counts.get(x.get("game"),0)>=max_per_game: continue
+        fam=x.get("market_family","")
+        is_prop=fam in {"pitcher_k","hits","total_bases","hrr","home_run"}
+        if is_prop and props>=prop_cap: continue
+        subj=x.get("subject","")
+        if is_prop and player_counts.get(subj,0)>=1: continue
+        if family_counts.get(fam,0)>=max(2,math.ceil(target_n*.35)): continue
+        selected.append(x)
+        game_counts[x.get("game")]=game_counts.get(x.get("game"),0)+1
+        family_counts[fam]=family_counts.get(fam,0)+1
+        if is_prop:
+            props+=1; player_counts[subj]=player_counts.get(subj,0)+1
+        if len(selected)>=target_n: break
+    # If caps leave empty slots, fill only with already-qualified picks, preserving max-per-game and player duplicate protection.
+    if len(selected)<target_n:
+        ids={id(x) for x in selected}
+        for x in pool:
+            if id(x) in ids: continue
+            if game_counts.get(x.get("game"),0)>=max_per_game: continue
+            subj=x.get("subject",""); fam=x.get("market_family","")
+            is_prop=fam in {"pitcher_k","hits","total_bases","hrr","home_run"}
+            if is_prop and player_counts.get(subj,0)>=1: continue
+            selected.append(x); game_counts[x.get("game")]=game_counts.get(x.get("game"),0)+1
+            if is_prop: player_counts[subj]=1
+            if len(selected)>=target_n: break
+    return selected
+
 # ================= V7 EXPRESS ENGINE =================
 def analyze_game_express_v7(g,selected_date):
     d=selected_date.isoformat() if hasattr(selected_date,"isoformat") else str(selected_date)
@@ -1705,6 +1790,26 @@ def analyze_game_express_v7(g,selected_date):
             items.append({"category":"F5","label":f"F5 {word} {line:g}","prob":p0,"prob_low":lo,"prob_high":hi,
                           "agreement":.90 if both else .75,"quality":q,"confirmed":both,"volatility":"medium",
                           "market_family":"f5_total","side":side,"line":line,"sample_values":totalvals,"subject":f"{g['away_abbr']} @ {g['home_abbr']}"})
+    # F5 moneyline candidates help diversify away from player props.
+    for side,abbr in [("away",g["away_abbr"]),("home",g["home_abbr"])]:
+        p0=sim_ml_prob(sim,side); lo,hi=_bands_from_sample_prob(p0,both,"medium")
+        items.append({"category":"F5","label":f"{abbr} F5 ML","prob":p0,"prob_low":lo,"prob_high":hi,
+                      "agreement":.86 if both else .72,"quality":q,"confirmed":both,"volatility":"medium",
+                      "market_family":"f5_ml","side":side,"line":0.0,"sample_values":None,"subject":abbr})
+
+    # Lightweight Full Game totals. Bullpen/staff adds uncertainty; these must clear the same conservative filters.
+    away_staff=get_team_pitching_profile(g["away_id"],season,d)
+    home_staff=get_team_pitching_profile(g["home_id"],season,d)
+    away_fg,home_fg,_=project_full_game_ensemble(af,hf,away_form,home_form,away_staff,home_staff,pf,weather)
+    fgsim=simulate_run_environment(away_fg,home_fg,max(35,q-8),False,stable_seed(g["game_pk"],d,"EXPRESS-FG"),n=6000,full_game=True,model_disagreement=ad["model_disagreement"]+hd["model_disagreement"])
+    fgvals=fgsim["away"]+fgsim["home"]
+    for line in [7.5,8.5,9.5,10.5]:
+        for side,word in [("over","Over"),("under","Under")]:
+            p0=_sample_prob(fgvals,line,side); lo,hi=_bands_from_sample_prob(p0,False,"medium")
+            items.append({"category":"Full Game","label":f"Full Game {word} {line:g}","prob":p0,"prob_low":lo,"prob_high":hi,
+                          "agreement":.78,"quality":max(35,q-8),"confirmed":False,"volatility":"medium",
+                          "market_family":"fg_total","side":side,"line":line,"sample_values":fgvals,"subject":f"{g['away_abbr']} @ {g['home_abbr']}"})
+
     items.extend(build_prop_candidates_v7(away_pitch,home_pitch,g['away_pitcher_name'],g['home_pitcher_name'],away_lineup,home_lineup,both))
     ranked=rank_automatic_candidates_v5(items,max_items=8)
     for x in ranked:
@@ -1714,12 +1819,10 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.1.1", page_icon="⚾", layout="wide")
-st_autorefresh(interval=30000, key="v653_refresh")
-
-st.title("⚾ MLB Betting Hub — V7.1.1 Alpha")
-st.caption("V7.1.1: valor por precio + momios de referencia + líneas editables + Express + parlays + LIVE corregido + persistencia.")
-st.info("🛠️ **V7.1.1 ALPHA** — Corrige el feed LIVE de MLB (StatsAPI v1.1). No cambia el modelo estadístico ni los momios.")
+st.set_page_config(page_title="MLB Betting Hub V7.2", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.2 Alpha")
+st.caption("V7.2: Express dinámico + modo Alta Probabilidad/Balanceado/Valor + edición de línea dentro del Top + diversificación automática + Paper Betting persistente.")
+st.info("🧪 **V7.2 ALPHA** — Rediseño de flujo. No promete apuestas seguras: prioriza probabilidad conservadora, riesgo, calidad de datos y precio cuando está disponible.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -1916,7 +2019,7 @@ else:
 st.caption(ready["advice"])
 if ready["reasons"]:
     st.caption("Pendiente: " + " · ".join(ready["reasons"]))
-st.caption("Statcast avanzado todavía no forma parte del semáforo; V7 no inventa esa capa.")
+st.caption("V7.2 mejora la simulación de bateadores con perfil 1B/2B/3B/HR, OBP/SLG y splits disponibles. Statcast/Savant completo sigue pendiente de integración validada.")
 
 current_context_snapshot=make_context_snapshot(
     game,away_pitch,home_pitch,away_lineup,home_lineup,weather,
@@ -2041,18 +2144,17 @@ avoid_list=build_avoid_list(automatic,{x["label"] for x in ranked_auto},max_item
 if "v653_history" not in st.session_state:
     st.session_state["v653_history"]=[]
 if "v653_paper_bets" not in st.session_state:
-    st.session_state["v653_paper_bets"]=persistent_load_paper_bets() if persistent_store_enabled() else []
+    st.session_state["v653_paper_bets"]=persistent_load_paper_bets()
 if persistent_store_enabled():
-    st.caption("💾 Persistencia: Supabase ACTIVA")
+    st.caption("💾 Paper Bets: Supabase activo + respaldo local.")
 else:
-    st.caption("⚠️ Persistencia externa no configurada. Paper Bets pueden perderse al reiniciar Streamlit; revisa README V7.")
+    st.caption("💾 Paper Bets: respaldo local activo para F5/reruns. Para sobrevivir redeploy/reinicio del servidor, configura Supabase una sola vez.")
 
 # =========================
 # Pantallas
 # =========================
-tab1,tabExpress,tab2,tabLine,tabParlay,tabLive,tab3,tab4,tab5=st.tabs([
-    "1️⃣ Partido","⚡ Express","2️⃣ Evaluar momios","✏️ Línea editable","🎟️ Parlays","🔴 LIVE",
-    "3️⃣ Analista experto","4️⃣ Paper betting","5️⃣ Rendimiento"
+tabExpress,tab1,tab2,tabParlay,tab4,tab5=st.tabs([
+    "⚡ Express","🔍 Partido","💵 Evaluar momios","🎟️ Parlays","🧪 Paper Bets","📊 Rendimiento"
 ])
 
 with tab1:
@@ -2060,10 +2162,10 @@ with tab1:
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V7.0 no ordena solo por %: usa probabilidad conservadora, acuerdo de modelos, incertidumbre y calidad.")
+    q3.caption("V7.2 separa probabilidad, confianza y riesgo; no ordena solo por porcentaje central.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V7.0 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V7.2 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
@@ -2096,9 +2198,8 @@ with tab1:
             )
             st.caption(detail_state)
             st.caption(item["reason"])
-            expert=expert_read(item,game,away_f5,home_f5,fg_total,park_factor,weather,both_confirmed,away_staff,home_staff)
-            support_txt=" · ".join(expert["supports"][:3]) if expert["supports"] else "sin apoyos adicionales fuertes"
-            st.caption(f"🧠 {expert['stance']} · {support_txt} · Riesgo principal: {expert['main_risk']}")
+            risk,ricon=risk_profile_v72(item)
+            st.caption(f"{ricon} Riesgo {risk} · {item.get('reason','')}")
 
         if analysis_summary["near"]:
             st.markdown("### 🟡 Cerca de calificar")
@@ -2185,128 +2286,126 @@ with tab1:
             st.write(note)
 
 with tabExpress:
-    st.subheader("⚡ Modo Express — toda la jornada")
-    st.caption("Busca oportunidades entre todos los juegos. No fuerza picks: si pides 10 y sólo califican 6, entrega 6.")
+    st.subheader("⚡ Express — qué puedo apostar AHORA")
+    st.caption("Cada búsqueda vuelve a revisar la jornada. Los juegos que ya empezaron se excluyen automáticamente.")
     e1,e2,e3,e4=st.columns(4)
-    target_n=e1.number_input("¿Cuántas apuestas buscas?",min_value=1,max_value=30,value=10,step=1)
-    require_full=e2.checkbox("Solo lineups completos",value=True)
-    max_per_game=e3.number_input("Máx. por partido",min_value=1,max_value=4,value=1,step=1)
-    max_props=e4.number_input("Máx. props",min_value=0,max_value=20,value=5,step=1)
-    if st.button("⚡ Analizar toda la jornada",type="primary",use_container_width=True,key="v7_express_run"):
-        allp=[];prog=st.progress(0,text="Analizando juegos...")
-        for i,g in enumerate(games):
+    target_n=int(e1.number_input("¿Cuántas apuestas buscas?",min_value=1,max_value=30,value=10,step=1))
+    objective=e2.selectbox("Objetivo",["🛡️ Alta probabilidad","⚖️ Balanceado","💰 Mejor valor"],index=0)
+    lineup_mode=e3.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0)
+    diversify=e4.checkbox("Diversificación automática",value=True,help="Evita que el Top quede dominado por props/jugadores cuando existen alternativas que también califican.")
+    max_per_game=st.slider("Máximo de selecciones por partido",1,3,1)
+
+    nowx=now_cdmx()
+    future_games=[g for g in games if game_is_pregame(g,nowx)]
+    started_count=len(games)-len(future_games)
+    st.caption(f"🕒 {nowx.strftime('%I:%M:%S %p')} CDMX · {len(future_games)} partidos aún no iniciados · {started_count} iniciados/finalizados excluidos")
+
+    if st.button("⚡ Buscar mejores oportunidades ahora",type="primary",use_container_width=True,key="v72_express_run"):
+        eligible=[]; complete=0; pending=0
+        pre=st.progress(0,text="1/2 Revisando horarios y lineups...")
+        for i,g in enumerate(future_games):
+            raw=get_lineups(g["game_pk"])
+            both=len(raw.get("away",[]))>=9 and len(raw.get("home",[]))>=9
+            complete+=int(both); pending+=int(not both)
+            if lineup_mode=="Solo completos" and not both:
+                pre.progress((i+1)/max(1,len(future_games)),text=f"Lineups {i+1}/{len(future_games)}")
+                continue
+            eligible.append(g)
+            pre.progress((i+1)/max(1,len(future_games)),text=f"Lineups {i+1}/{len(future_games)}")
+        pre.empty()
+        st.session_state["v72_express_counts"]={"future":len(future_games),"complete":complete,"pending":pending,"eligible":len(eligible),"started":started_count,"time":nowx.strftime('%H:%M:%S')}
+
+        allp=[]
+        prog=st.progress(0,text="2/2 Analizando solo partidos elegibles...")
+        for i,g in enumerate(eligible):
             try:
                 picks,meta=analyze_game_express_v7(g,selected_date)
-                if require_full and not meta["both"]:
-                    prog.progress((i+1)/len(games),text=f"{i+1}/{len(games)}")
-                    continue
                 allp.extend(picks)
-            except Exception:
+            except Exception as ex:
                 pass
-            prog.progress((i+1)/len(games),text=f"{i+1}/{len(games)}")
+            prog.progress((i+1)/max(1,len(eligible)),text=f"Analizados {i+1}/{len(eligible)}")
+        prog.empty()
+
         enriched=[]
         for x in allp:
-            y=dict(x);y["confidence_score"]=confidence_score(y)
-            y["express_score"]=y.get("prob_low",y["prob"])*.55+y["confidence_score"]/100*.45
+            y=dict(x); y["confidence_score"]=confidence_score(y)
+            risk,ricon=risk_profile_v72(y); y["risk_label"]=risk; y["risk_icon"]=ricon
             enriched.append(y)
-        enriched=sorted(enriched,key=lambda z:z["express_score"],reverse=True)
+        # Pre-rank without odds so High Probability mode does not depend on the market API.
+        enriched=sorted(enriched,key=lambda z:(z.get("prob_low",0),z.get("confidence_score",0)),reverse=True)
+        prepool=enriched[:max(target_n*4,32)]
 
-        # V7.1: consultar precio sólo para un pool corto. Evita gastar cuota en todo el slate.
-        prepool=enriched[:max(int(target_n)*3,24)]
-        if odds_api_enabled():
+        if odds_api_enabled() and prepool:
             prepool,usage=enrich_candidates_reference_odds(prepool,games)
-            st.session_state["v71_odds_usage"]=usage
-            for y in prepool:
-                if y.get("reference_odds"):
-                    # El valor contra mercado tiene prioridad; robustez sigue siendo parte del ranking.
-                    verdict_bonus={"APOSTAR":.20,"CANDIDATO":.08,"PASS":-.20}.get(y.get("reference_verdict"),0)
-                    y["express_value_score"]=verdict_bonus + max(-.25,min(.30,float(y.get("reference_ev_cons",0))))*.9 + y.get("prob_low",y["prob"])*.28 + y["confidence_score"]/100*.22
-                else:
-                    y["express_value_score"]=-1+y["express_score"]*.1
-            prepool=sorted(prepool,key=lambda z:z.get("express_value_score",-9),reverse=True)
-
-        chosen=[];game_counts={};props_count=0
-        for x in prepool:
-            if game_counts.get(x["game"],0)>=max_per_game: continue
-            isprop=x.get("category") in ("Pitcher Ks","Hits","Total Bases","HRR","Home Run")
-            if isprop and props_count>=max_props: continue
-            # Con API configurada, Express sólo recomienda picks cuyo precio de referencia no sea PASS.
-            if odds_api_enabled() and x.get("reference_verdict") not in ("APOSTAR","CANDIDATO"): continue
-            chosen.append(x);game_counts[x["game"]]=game_counts.get(x["game"],0)+1
-            if isprop:props_count+=1
-            if len(chosen)>=target_n:break
+            st.session_state["v72_odds_usage"]=usage
+        for y in prepool:
+            y["express_objective_score"]=express_objective_score_v72(y,objective)
+        qualified=[y for y in prepool if express_qualifies_v72(y,objective)]
+        qualified=sorted(qualified,key=lambda z:z.get("express_objective_score",-9),reverse=True)
+        chosen=diversify_express_v72(qualified,target_n,max_per_game=max_per_game,automatic=diversify)
         st.session_state["v7_express_results"]=chosen
-    express=st.session_state.get("v7_express_results",[])
+        st.session_state["v72_express_objective"]=objective
+        st.session_state["v72_express_lineup_mode"]=lineup_mode
+
+    counts=st.session_state.get("v72_express_counts")
+    if counts:
+        a,b,c,d=st.columns(4)
+        a.metric("Elegibles analizados",counts["eligible"])
+        b.metric("Lineup completo",counts["complete"])
+        c.metric("Lineup pendiente",counts["pending"])
+        d.metric("Ya iniciados",counts["started"])
+        st.caption(f"Última búsqueda Express: {counts['time']} CDMX")
+
     if odds_api_enabled():
-        usage=st.session_state.get("v71_odds_usage",{})
+        usage=st.session_state.get("v72_odds_usage",{})
         rem=usage.get("remaining")
-        st.caption(f"🌐 The Odds API conectada" + (f" · créditos restantes: {rem}" if rem not in (None,"None") else ""))
+        st.caption("🌐 Momios de referencia conectados"+(f" · créditos restantes: {rem}" if rem not in (None,"None") else ""))
     else:
-        st.warning("🌐 Momios de referencia NO configurados. Agrega ODDS_API_KEY en Streamlit Secrets.")
+        st.caption("🌐 Sin API de momios: Alta Probabilidad y parte de Balanceado siguen funcionando con el modelo; Mejor Valor requiere precio.")
+
+    express=st.session_state.get("v7_express_results",[])
     if express:
-        st.success(f"Encontré {len(express)} oportunidades seleccionadas.")
+        st.success(f"Top actual: {len(express)} oportunidades. Si pediste más y no aparecen, no hubo suficientes que calificaran.")
         for i,x in enumerate(express,1):
-            st.markdown(f"**{i}. {x['game']} · {x['label']}**")
-            if x.get("reference_odds"):
-                q=x.get("reference_quote",{})
-                line_note=f" · línea mercado {q.get('line'):g}" if q.get("line") is not None and abs(float(q.get('line'))-float(x.get('line',q.get('line'))))>.001 else ""
-                verdict=x.get("reference_verdict","CANDIDATO")
-                icon="🟢" if verdict=="APOSTAR" else "🟡"
-                st.caption(f"{icon} {verdict} · Momio ref. {x['reference_odds']:.2f}x (mediana {x.get('reference_books',0)} casas){line_note} · Mejor {x.get('reference_best_odds',0):.2f}x {x.get('reference_best_book','')} · EV cons. {x.get('reference_ev_cons',0)*100:+.1f}% · Conf. {x.get('confidence_score',0)}/100")
-            else:
-                st.caption(f"Sin cuota de referencia encontrada · Conservadora {x.get('prob_low',x['prob'])*100:.1f}% · Confianza {x.get('confidence_score',0)}/100 · Momio mínimo modelo ≈ {x.get('model_target_odds',0):.2f}x")
-
-with tabLine:
-    st.subheader("✏️ Probar la línea que realmente tiene Draftea")
-    editable=[x for x in automatic if x.get("sample_values") is not None]
-    if not editable:
-        st.info("No hay mercados editables en este partido.")
-    else:
-        labels={x["label"]:x for x in editable}
-        chosen=labels[st.selectbox("Mercado base",list(labels.keys()),key="v7_line_base")]
-        ref_key=f"v71_line_ref_{game['game_pk']}_{chosen['label']}"
-        c_ref1,c_ref2=st.columns([1,2])
-        if c_ref1.button("🌐 Buscar momio referencia",use_container_width=True,key=f"btn_{ref_key}"):
-            if not odds_api_enabled():
-                st.session_state[ref_key]={"error":"Falta ODDS_API_KEY en Streamlit Secrets"}
-            else:
-                events,_=odds_api_events(); ev=odds_event_for_game(game,events); mk=_odds_market_key(chosen)
-                if ev and mk:
-                    dat,u=odds_api_event_odds(ev.get("id"),mk)
-                    q=reference_quote_from_event(chosen,dat)
-                    st.session_state[ref_key]={"quote":q,"usage":u}
+            risk=x.get("risk_label") or risk_profile_v72(x)[0]; ricon=x.get("risk_icon") or risk_profile_v72(x)[1]
+            with st.container(border=True):
+                st.markdown(f"### {i}. {x['game']} · {x['label']}")
+                m1,m2,m3,m4=st.columns(4)
+                m1.metric("Prob. central",f"{x.get('prob',0)*100:.1f}%")
+                m2.metric("Conservadora",f"{x.get('prob_low',0)*100:.1f}%")
+                m3.metric("Confianza",f"{x.get('confidence_score',0)}/100")
+                m4.metric("Riesgo",f"{ricon} {risk}")
+                if x.get("line_repriced"):
+                    st.caption(f"🔄 Línea de mercado detectada y recalculada: {float(x.get('original_model_line')):g} → {float(x.get('line')):g}.")
+                if x.get("reference_odds"):
+                    st.caption(f"🌐 Ref. {x['reference_odds']:.2f}x · mínimo modelo {x.get('reference_target_odds',x.get('model_target_odds',0)):.2f}x · EV conservador {x.get('reference_ev_cons',0)*100:+.1f}% · {x.get('reference_books',0)} casas")
                 else:
-                    st.session_state[ref_key]={"error":"No encontré el evento/mercado en la API"}
-        ref=st.session_state.get(ref_key,{})
-        q=ref.get("quote")
-        if q:
-            c_ref2.success(f"Referencia: {q['median']:.2f}x · línea {q['line']:g} · {q['books']} casas · mejor {q['best']:.2f}x en {q['best_book']}")
-        elif ref.get("error"):
-            c_ref2.warning(ref["error"] )
-        else:
-            c_ref2.caption("Consulta sólo cuando la necesites para ahorrar créditos de la API.")
+                    st.caption(f"Momio mínimo orientativo ≈ {x.get('model_target_odds',0):.2f}x · esta selección fue elegida por probabilidad/riesgo, no por precio.")
+                if x.get("reason"): st.caption("📌 "+x["reason"])
 
-        default_line=float(q.get("line")) if q else float(chosen.get("line",.5))
-        default_odds=float(q.get("median")) if q else 1.80
-        l1,l2,l3=st.columns(3)
-        new_side=l1.selectbox("Lado",["over","under"],index=0 if chosen.get("side")=="over" else 1,format_func=lambda x:"Más / Over" if x=="over" else "Menos / Under",key=f"side_{chosen['label']}")
-        new_line=l2.number_input("Línea disponible",value=default_line,step=.5,key=f"line_{chosen['label']}")
-        new_odds=l3.number_input("Momio Draftea / referencia",min_value=1.01,max_value=20.0,value=default_odds,step=.01,format="%.2f",key=f"odds_{chosen['label']}")
-        repriced=v7_reprice_line(chosen,new_line,new_side)
-        if repriced:
-            pm=v7_price_metrics(repriced,new_odds)
-            a,b,c,d,e=st.columns(5)
-            a.metric("Prob. central",f"{repriced['prob']*100:.1f}%")
-            b.metric("Conservadora",f"{repriced['prob_low']*100:.1f}%")
-            c.metric("Momio justo",f"{pm['fair_cons']:.2f}x")
-            d.metric("Momio mínimo",f"{pm['target']:.2f}x")
-            e.metric("EV conservador",f"{pm['ev_cons']*100:+.1f}%")
-            st.markdown(f"### {'🟢' if pm['verdict']=='APOSTAR' else '🟡' if pm['verdict']=='CANDIDATO' else '⚪'} {pm['verdict']}")
-            if q and abs(float(new_odds)-float(q['median']))<.005:
-                st.caption("Se está evaluando con la mediana del mercado de referencia. Si Draftea muestra otro momio, edítalo y el veredicto cambia al instante.")
-            else:
-                st.caption("El valor final usa el momio escrito arriba. Puedes sustituirlo por el de Draftea.")
-
+                # Inline line editor requested by the user: edit the recommendation itself, not a separate tab.
+                if x.get("sample_values") is not None:
+                    with st.expander("✏️ Draftea tiene otra línea / editar esta apuesta"):
+                        c1,c2,c3=st.columns(3)
+                        side=c1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"v72_side_{x['game_pk']}_{i}")
+                        line=c2.number_input("Línea disponible en Draftea",value=float(x.get("line",.5)),step=.5,key=f"v72_line_{x['game_pk']}_{i}")
+                        default_od=float(x.get("reference_odds") or 1.80)
+                        od=c3.number_input("Momio Draftea",min_value=1.01,max_value=20.0,value=default_od,step=.01,format="%.2f",key=f"v72_odds_{x['game_pk']}_{i}")
+                        rx=v7_reprice_line(x,line,side)
+                        if rx:
+                            pm=v7_price_metrics(rx,od); rr,ri=risk_profile_v72(rx)
+                            z1,z2,z3,z4,z5=st.columns(5)
+                            z1.metric("Nueva prob.",f"{rx['prob']*100:.1f}%")
+                            z2.metric("Conservadora",f"{rx['prob_low']*100:.1f}%")
+                            z3.metric("Momio mínimo",f"{pm['target']:.2f}x")
+                            z4.metric("EV cons.",f"{pm['ev_cons']*100:+.1f}%")
+                            z5.metric("Riesgo",f"{ri} {rr}")
+                            icon="🟢" if pm["verdict"]=="APOSTAR" else "🟡" if pm["verdict"]=="CANDIDATO" else "⚪"
+                            st.markdown(f"**{icon} {pm['verdict']} con la línea {line:g} @ {od:.2f}x**")
+                            st.caption("La probabilidad fue recalculada para ESTA línea; nunca se reutiliza la probabilidad de la línea original.")
+                    
+    else:
+        st.info("Ejecuta Express. Puede devolver menos apuestas de las solicitadas si no hay suficientes con el nivel requerido.")
 
 with tabParlay:
     st.subheader("🎟️ Constructor de Parlays — todos los juegos")
@@ -2345,11 +2444,6 @@ with tabParlay:
             combined=float(np.prod(actual_odds))
             st.metric("Momio combinado",f"{combined:.2f}x")
             st.caption(f"Probabilidad conjunta conservadora aproximada (asumiendo independencia): {joint*100:.1f}%. No es un parlay 'seguro'; la dependencia entre mercados puede alterar esa cifra.")
-
-with tabLive:
-    st.subheader("🔴 Marcador LIVE")
-    st.caption("Visualización solamente. El resultado LIVE no modifica las probabilidades pregame de V7.")
-    render_live_scoreboard(game)
 
 with tab2:
     st.subheader("💰 ¿El precio de Draftea compensa el riesgo?")
@@ -2520,64 +2614,6 @@ with tab2:
                         f"lineups {'confirmados' if both_confirmed else 'pendientes'}."
                     )
 
-with tab3:
-    st.subheader("🧠 Analista experto del partido")
-    st.caption("Esta capa interpreta la salida estadística; distingue pitcher confirmado, lineup confirmado y predicción provisional.")
-
-    if not st.session_state.get("v653_analysis_ready",False):
-        st.info("Primero pulsa **🧠 Analizar partido**.")
-    else:
-        if ranked_auto:
-            best=ranked_auto[0]
-            er=expert_read(best,game,away_f5,home_f5,fg_total,park_factor,weather,both_confirmed,away_staff,home_staff)
-            st.markdown(f"### 🎯 Lectura principal: {er['stance']} — {best['label']}")
-            a,b,c=st.columns(3)
-            a.metric("Prob. conservadora",f"{best['prob_low']*100:.1f}%")
-            b.metric("Confianza",f"{best['confidence_score']}/100")
-            c.metric("Acuerdo",f"{best.get('agreement',0)*100:.0f}%")
-
-            st.markdown("**Lo que apoya la lectura**")
-            if er["supports"]:
-                for x in er["supports"]: st.write(f"✅ {x}")
-            else: st.write("• No hay apoyos contextuales adicionales fuertes.")
-
-            st.markdown("**Riesgos que un analista no debería ignorar**")
-            if er["risks"]:
-                for x in er["risks"]: st.write(f"⚠️ {x}")
-            else: st.write("✅ No detecté un riesgo estructural dominante con los datos disponibles.")
-
-            st.markdown("**Lectura del partido**")
-            direction="producción ofensiva" if "Over" in best["label"] else "contención de carreras" if "Under" in best["label"] else "ventaja relativa"
-            lineup_txt="con lineups confirmados" if both_confirmed else "todavía sin ambos lineups oficiales"
-            st.write(
-                f"El modelo encuentra su señal más estable en **{best['label']}**. "
-                f"La lectura se basa en {direction}, {lineup_txt}, el acuerdo entre submodelos y la simulación. "
-                f"El principal motivo para no aumentar más la confianza es **{er['main_risk']}**."
-            )
-        else:
-            st.info("⚪ El analista experto coincide con PASS: no hay una señal suficientemente robusta.")
-
-        st.markdown("### 🚫 Qué evitar por ahora")
-        if avoid_list:
-            for i,x in enumerate(avoid_list,1):
-                st.write(
-                    f"**{i}. {x['label']}** — central {x['prob']*100:.1f}% · "
-                    f"conservadora {x.get('prob_low',x['prob'])*100:.1f}% · confianza {x['confidence_score']}/100"
-                )
-                st.caption("Evitar/esperar: "+" · ".join(x["avoid_reasons"]))
-        else:
-            st.caption("No detecté mercados especialmente engañosos entre los analizados.")
-
-        st.markdown("### 🧩 Consenso del sistema")
-        if ranked_auto:
-            for x in ranked_auto[:5]:
-                st.write(
-                    f"**{x['label']}** — acuerdo {x.get('agreement',0)*100:.0f}% · "
-                    f"rango {x.get('prob_low',x['prob'])*100:.1f}–{x.get('prob_high',x['prob'])*100:.1f}% · "
-                    f"confianza {x['confidence_score']}/100"
-                )
-        st.caption("Statcast avanzado (xwOBA/xSLG/Barrel/Hard-Hit) queda como la siguiente integración; V6 no lo simula ni lo inventa.")
-
 
 with tab4:
     st.subheader("🧪 Paper Betting — predicciones congeladas")
@@ -2669,7 +2705,7 @@ with tab4:
 
         if st.button("🗑️ Limpiar Paper Betting",key="clear_paper_v65"):
             st.session_state["v653_paper_bets"]=[]
-            if persistent_store_enabled(): persistent_delete_all_paper_bets()
+            persistent_delete_all_paper_bets()
             st.rerun()
 
 with tab5:
@@ -2766,6 +2802,6 @@ with tab5:
 
 st.divider()
 st.caption(
-    "V7.0 ALPHA. La probabilidad mostrada no es una garantía. "
-    "Usa primero Paper Betting y congela el algoritmo durante el bloque de prueba. Statcast avanzado todavía no está integrado."
+    "V7.2 ALPHA. Alta probabilidad no significa apuesta segura. El objetivo es elevar selección y calibración, no prometer un porcentaje fijo de aciertos. "
+    "Paper Betting debe validar el modelo antes de aumentar riesgo real."
 )

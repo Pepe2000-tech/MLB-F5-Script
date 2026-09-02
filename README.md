@@ -1,70 +1,56 @@
-# MLB Betting Hub — V7.1.1 Alpha
+# MLB Betting Hub — V7.2 Alpha
 
-V7.1.1 agrega **momios de referencia automáticos** a la arquitectura V7.
+V7.2 rediseña el flujo para responder una pregunta: **¿qué puedo apostar AHORA entre los juegos que todavía no empiezan?**
 
-## Qué cambia en V7.1.1
+## Cambios principales
 
-- Integra The Odds API usando `baseball_mlb`.
-- Consulta cuotas en formato decimal.
-- Usa mercado US como referencia (`regions=us`).
-- Para cada pick puede mostrar:
-  - mediana de momios entre casas disponibles;
-  - mejor momio encontrado y casa;
-  - número de casas usadas;
-  - línea de mercado encontrada;
-  - EV conservador contra ese precio;
-  - veredicto APOSTAR / CANDIDATO / PASS.
-- Si la API ofrece una línea distinta a la recomendada por el modelo, V7.1.1 recalcula la probabilidad sobre la línea de mercado antes de evaluar el precio.
-- El momio de Draftea sigue siendo editable manualmente y tiene prioridad para la decisión final.
-- Modo Express consulta momios sólo para un pool corto de candidatos para reducir consumo de créditos.
-- El constructor de parlays usa el momio de referencia como valor inicial cuando existe.
+- Se elimina la pestaña **Analista experto**.
+- Se elimina la pestaña independiente **Línea editable**.
+- La edición de línea ahora vive dentro de cada recomendación de **Express**. Si Draftea ofrece otra línea, se cambia ahí y V7.2 recalcula la probabilidad para esa línea antes de evaluar el momio.
+- Express vuelve a revisar el estado de la jornada en cada búsqueda y excluye juegos `Live` o `Final`.
+- Filtro de lineups: **Solo completos** o **Completos o pendientes**.
+- Tres objetivos de búsqueda:
+  - 🛡️ Alta probabilidad: prioriza probabilidad conservadora, confianza y baja volatilidad; no exige momio de referencia para existir.
+  - ⚖️ Balanceado: mezcla robustez y precio.
+  - 💰 Mejor valor: exige precio de referencia y busca EV.
+- Se reemplaza “Máx. props” por **Diversificación automática**. Es un límite blando: evita que todo el Top sean jugadores, pero no mete picks débiles solo para completar variedad.
+- Express trabaja en dos pasos: pre-filtro de juegos/lineups y análisis solo de los elegibles.
+- Se agregan F5 ML y Full Game totals al pool Express para aumentar variedad de mercados.
+- Mejor simulación de bateadores: el Total Bases ya no usa solo Poisson; se simula perfil de 1B/2B/3B/HR por aparición al plato con regresión a la media. HRR incorpora OBP/SLG como ajuste acotado.
+- Cada pick muestra **Probabilidad central, conservadora, confianza y riesgo** por separado.
+- Paper Betting ya no depende únicamente de `st.session_state`: existe respaldo JSON local para sobrevivir F5/reruns en la misma instancia. Si Supabase está configurado, se usa como persistencia externa real.
+- Los momios de referencia siguen siendo opcionales para Alta Probabilidad y necesarios para el modo Mejor Valor.
 
-## Mercados de referencia conectados
+## Importante sobre Paper Betting
 
-- F5 Totals: `alternate_totals_1st_5_innings`
-- Full Game Totals: `totals`
-- Pitcher strikeouts: `pitcher_strikeouts`
-- Batter hits: `batter_hits`
-- Batter total bases: `batter_total_bases`
-- Hits + Runs + RBIs: `batter_hits_runs_rbis`
-- Batter home runs: `batter_home_runs`
+El respaldo local resuelve el borrado por F5/rerun mientras la instancia de Streamlit siga viva. Streamlit Community Cloud puede reiniciar/recrear el servidor, así que para persistencia permanente se recomienda Supabase.
 
-## Configuración
-
-En Streamlit Community Cloud abre:
-
-`App > Settings > Secrets`
-
-y agrega:
+### Streamlit Secrets
 
 ```toml
-ODDS_API_KEY = "TU_API_KEY"
+ODDS_API_KEY = "..."
+SUPABASE_URL = "https://TU_PROYECTO.supabase.co"
+SUPABASE_KEY = "TU_ANON_KEY"
 ```
 
-No coloques la llave real dentro de `app.py` ni la subas a GitHub.
+Ejecuta `supabase_schema.sql` una sola vez en Supabase SQL Editor.
 
-## Uso recomendado
+## Filosofía V7.2
 
-1. Abre **⚡ Express**.
-2. Selecciona cuántas apuestas quieres buscar.
-3. Pulsa **Analizar toda la jornada**.
-4. V7.1.1 calcula primero el modelo y después consulta precios sólo para candidatos preseleccionados.
-5. Express prioriza picks cuyo precio de referencia tenga valor según la probabilidad conservadora.
-6. En Draftea, sustituye el momio de referencia por el momio real si es diferente.
-7. En **✏️ Línea editable**, puedes consultar una cuota de referencia específica y recalcular una línea alternativa.
+- Alta probabilidad **no significa apuesta segura**.
+- No se fuerza un Top 10 si solo hay 4 o 6 picks que cumplen.
+- La línea debe coincidir exactamente con la probabilidad evaluada.
+- El precio ayuda a decidir, pero el modo Alta Probabilidad puede descubrir picks sin depender 100% de momios.
+- La meta es mejorar calibración y selección; no se promete un porcentaje fijo como 13/16.
 
-## Importante
+## Instalación
 
-El momio mostrado es una **referencia de mercado**, no una cuota de Draftea ni una garantía de disponibilidad. Las casas pueden mover líneas y precios rápidamente.
+Sube/reemplaza en GitHub:
 
-La API utiliza créditos por mercados/regiones consultados. V7.1.1 agrupa mercados por juego y limita el pool consultado para evitar gasto innecesario. La pantalla Express muestra los créditos restantes cuando la API los devuelve.
+- `app.py`
+- `requirements.txt`
+- `README.md`
+- `supabase_schema.sql`
+- `.streamlit_secrets_example.toml`
 
-## Persistencia
-
-Supabase sigue siendo opcional. Consulta `supabase_schema.sql` y `.streamlit_secrets_example.toml`.
-
-
-## V7.1.1 hotfix LIVE
-- Corrige el endpoint de MLB `feed/live` de `/api/v1` a `/api/v1.1`.
-- Añade estado LIVE, conteo, corredores, pitcher/bateador, pitch count y última jugada cuando MLB los publica.
-- No modifica probabilidades, filtros, Monte Carlo, confianza ni lógica de apuestas.
+Streamlit Community Cloud redeploya desde `main`.
