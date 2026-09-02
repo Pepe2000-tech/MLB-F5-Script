@@ -1,30 +1,34 @@
-# MLB Betting Hub V7.6.7 Alpha — Calibrated Prop Ladder
+# MLB Betting Hub — V7.6.8 Alpha
 
-Esta versión parte de V7.6.6 y mantiene sus protecciones: Express selectivo, menú rápido, F5 limitado a Over 4.5 / Under 5.5, líneas Draftea recordadas, exclusión automática de selecciones ya guardadas en Paper Bets, Multi-Parlays y Paper Parlays completos.
+## Nuevo: ✍️ F5 Manual
 
-## Cambios V7.6.7
+Esta versión recupera la idea del primer MVP: tú escribes manualmente el mercado que realmente ves en Draftea y el sistema analiza esa apuesta exacta.
 
-### 1. Probability Guard
-El motor conserva la probabilidad cruda de la simulación, pero antes del ranking aplica una capa preventiva de calibración que reduce sobreconfianza según calidad de datos, confiabilidad del mercado, acuerdo entre modelos, lineups y volatilidad. La probabilidad cruda queda guardada para auditoría.
+### Cómo usar F5 Manual
+1. Selecciona la fecha y el partido arriba.
+2. Abre la pestaña **✍️ F5 Manual**.
+3. Captura la **línea F5 real de Draftea**.
+4. Captura el **momio Over** y el **momio Under** en formato decimal.
+5. Pulsa **🧠 Analizar línea F5 manual**.
 
-Esto no garantiza mayor acierto: busca que un 70–80% sólo sobreviva como tal cuando la evidencia del mercado realmente sea fuerte.
+La pestaña compara ambos lados usando el motor avanzado actual:
+- proyección F5 por equipo;
+- abridores y forma reciente;
+- lineups;
+- parque y clima cuando están disponibles;
+- Monte Carlo con incertidumbre;
+- submodelos de F5;
+- calibración de Paper Bets cuando ya existe muestra suficiente;
+- probability guard V7.6.7;
+- probabilidad ajustada y conservadora;
+- momio justo;
+- EV conservador;
+- confianza, Market Reliability y Bet Quality.
 
-### 2. Prop Ladder 1+ / 2+ / 3+
-Hits, Total Bases y HRR ya no se reducen automáticamente a un único escalón. El analizador conserva 1+, 2+, 3+ (y 4+ donde exista en la simulación) para comparar internamente el riesgo adicional.
+El resultado final queda simplificado como **APOSTAR / CANDIDATO / PASS** y puedes guardar directamente la selección en Paper Bets con la línea y momio exactos.
 
-La salida principal sigue favoreciendo las selecciones conservadoras, pero Express añade una sección separada `Escalón + riesgo` para mostrar 2+/3+ cuando la distribución mantiene suficiente señal.
+## Importante
+La pestaña automática Express sigue limitada a F5 Over 4.5 / Under 5.5. **F5 Manual no tiene esa limitación**, porque su propósito es analizar exactamente la línea que el usuario introduce desde Draftea.
 
-### 3. No se disfraza 2+ como apuesta segura
-Las alternativas de escalón superior se muestran aparte y con su probabilidad ajustada/conservadora. No se convierten en verde sólo por pagar más o por ser más agresivas.
-
-### 4. Auditoría de probabilidades
-En el análisis detallado se puede comparar `Cruda` vs `Ajustada`, lo que facilita detectar si el modelo estaba siendo demasiado optimista.
-
-## Archivos
-- `app.py`
-- `requirements.txt`
-- `supabase_schema.sql`
-- `.streamlit_secrets_example.toml`
-
-## Despliegue
-Reemplaza los archivos de la versión anterior en GitHub y haz commit a `main`. Streamlit Community Cloud debería volver a desplegar automáticamente.
+## Actualización
+Reemplaza en GitHub los archivos de esta carpeta y haz commit en `main`. Streamlit debería redeployar automáticamente.
