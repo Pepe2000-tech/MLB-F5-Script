@@ -14,7 +14,7 @@ import streamlit as st
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.4.1"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.5"}
 CDMX_TZ=ZoneInfo("America/Mexico_City")
 
 def now_cdmx():
@@ -30,6 +30,59 @@ def _secret(name, default=None):
         return default
 
 LOCAL_PAPER_STORE=os.getenv("MLB_PAPER_STORE","/tmp/mlb_betting_hub_v72_paper_bets.json")
+LOCAL_DRAFTEA_LINES=os.getenv("MLB_DRAFTEA_LINES","/tmp/mlb_betting_hub_v765_draftea_lines.json")
+
+def _load_draftea_lines_v765():
+    try:
+        if not os.path.exists(LOCAL_DRAFTEA_LINES): return {}
+        with open(LOCAL_DRAFTEA_LINES,"r",encoding="utf-8") as f:
+            rows=json.load(f)
+        return rows if isinstance(rows,dict) else {}
+    except Exception:
+        return {}
+
+def _write_draftea_lines_v765(rows):
+    try:
+        tmp=LOCAL_DRAFTEA_LINES+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f:
+            json.dump(rows,f,ensure_ascii=False,default=str)
+        os.replace(tmp,LOCAL_DRAFTEA_LINES)
+        return True
+    except Exception:
+        return False
+
+def draftea_line_overrides_v765():
+    if "v765_draftea_market_lines" not in st.session_state:
+        st.session_state["v765_draftea_market_lines"]=_load_draftea_lines_v765()
+    return st.session_state["v765_draftea_market_lines"]
+
+def draftea_line_key_v765(game_pk,market_family,subject,bet_date=None):
+    return f"{bet_date or ''}|{int(game_pk or 0)}|{str(market_family or '').lower()}|{str(subject or '').strip().lower()}"
+
+def save_draftea_line_v765(item,line,bet_date=None):
+    """Memoriza la línea REAL disponible; no fija el pick ni su ranking."""
+    fam=str(item.get("market_family","") or "")
+    if fam not in {"pitcher_k","hits","total_bases","hrr","home_run"}: return False
+    key=draftea_line_key_v765(item.get("game_pk"),fam,item.get("subject"),bet_date)
+    rows=dict(draftea_line_overrides_v765())
+    rows[key]={"line":float(line),"updated_at":datetime.now(CDMX_TZ).isoformat(timespec="seconds")}
+    st.session_state["v765_draftea_market_lines"]=rows
+    return _write_draftea_lines_v765(rows)
+
+def delete_draftea_line_v765(item,bet_date=None):
+    key=draftea_line_key_v765(item.get("game_pk"),item.get("market_family"),item.get("subject"),bet_date)
+    rows=dict(draftea_line_overrides_v765())
+    existed=key in rows
+    rows.pop(key,None)
+    st.session_state["v765_draftea_market_lines"]=rows
+    _write_draftea_lines_v765(rows)
+    return existed
+
+def get_draftea_line_v765(item,bet_date=None):
+    key=draftea_line_key_v765(item.get("game_pk"),item.get("market_family"),item.get("subject"),bet_date)
+    row=draftea_line_overrides_v765().get(key)
+    try: return float(row.get("line")) if isinstance(row,dict) and row.get("line") is not None else None
+    except Exception: return None
 
 def persistent_store_enabled():
     return bool(_secret("SUPABASE_URL") and _secret("SUPABASE_KEY"))
@@ -273,6 +326,18 @@ def enrich_candidates_reference_odds(candidates,games_list):
             market_line=float(q["line"])
             line_changed=abs(market_line-original_line)>.001
             priced=original
+
+            # V7.6.5: la línea REAL informada por el usuario en Draftea tiene prioridad sobre
+            # una línea distinta del consenso externo. Una referencia incompatible no sustituye Draftea.
+            if line_changed and original.get("draftea_line_known"):
+                out[i].update({
+                    "reference_quote":None,"reference_odds":None,"reference_best_odds":None,
+                    "reference_line":market_line,"reference_books":q.get("books",0),
+                    "original_model_line":original_line,"line_repriced":False,
+                    "reference_verdict":"LINEA REF DISTINTA","reference_ev_cons":None,
+                    "reference_note":"La referencia externa usa otra línea; se conserva la línea real de Draftea."
+                })
+                continue
 
             # Regla V7.1.3: jamás usar la probabilidad de una línea para valorar otra.
             if line_changed:
@@ -1604,6 +1669,94 @@ def v7_reprice_line(item,new_line,new_side):
     x["prob"]=p;x["prob_low"]=lo;x["prob_high"]=hi;x["confidence_score"]=confidence_score(x)
     return x
 
+def market_display_label_v765(item):
+    """Presenta props de conteo como Draftea (1+, 2+, 3+) sin alterar la línea matemática interna."""
+    fam=str(item.get("market_family","") or "")
+    subj=str(item.get("subject") or "Mercado")
+    side=str(item.get("side") or "over")
+    line=float(item.get("line",0) or 0)
+    cat=str(item.get("category") or "")
+    if fam in {"hits","total_bases","hrr","home_run"}:
+        threshold=max(1,int(math.floor(line)+1))
+        unit={"hits":"Hits","total_bases":"Total Bases","hrr":"HRR","home_run":"HR"}.get(fam,cat)
+        if side=="over": return f"{subj} {threshold}+ {unit}"
+        return f"{subj} Menos de {threshold} {unit}"
+    if fam=="pitcher_k":
+        word="Over" if side=="over" else "Under"
+        return f"{subj} {word} {line:g} K"
+    return str(item.get("label") or f"{subj} {cat}")
+
+def _reprice_from_group_v765(group,line,side):
+    base=next((z for z in group if z.get("sample_values") is not None),None)
+    if base is None: return None
+    y=v7_reprice_line(base,float(line),side)
+    if y is None: return None
+    y["label"]=market_display_label_v765(y)
+    return y
+
+def normalize_draftea_prop_candidates_v765(items,game_pk=None,bet_date=None):
+    """Normaliza la capa apostable sin alterar las simulaciones internas."""
+    passthrough=[]; groups={}
+    for z0 in items:
+        z=dict(z0)
+        if game_pk and not z.get("game_pk"): z["game_pk"]=game_pk
+        fam=str(z.get("market_family","") or "")
+        if fam not in {"pitcher_k","hits","total_bases","hrr","home_run"}:
+            passthrough.append(z); continue
+        groups.setdefault((fam,str(z.get("subject") or "")),[]).append(z)
+    out=list(passthrough)
+    for (fam,subj),grp in groups.items():
+        probe=dict(grp[0]); probe["game_pk"]=game_pk or probe.get("game_pk")
+        override=get_draftea_line_v765(probe,bet_date)
+        if override is not None:
+            sides=["over","under"] if fam=="pitcher_k" else ["over"]
+            for side in sides:
+                y=_reprice_from_group_v765(grp,override,side)
+                if y:
+                    y["game_pk"]=game_pk or y.get("game_pk")
+                    y["draftea_line_known"]=True; y["line_source"]="Draftea manual"; y["needs_draftea_line"]=False
+                    out.append(y)
+            continue
+        overs=[z for z in grp if z.get("side")=="over"]
+        if not overs: continue
+        if fam=="pitcher_k":
+            # Solo una línea central estimada; evita Under extremos que parecen 'seguros' sin existir en Draftea.
+            anchor=min(overs,key=lambda z:abs(float(z.get("prob",.5))-.50))
+            anchor_line=float(anchor.get("line",4.5))
+            for side in ["over","under"]:
+                y=_reprice_from_group_v765(grp,anchor_line,side)
+                if y:
+                    y["game_pk"]=game_pk or y.get("game_pk")
+                    y["draftea_line_known"]=False; y["line_source"]="estimada por modelo"; y["needs_draftea_line"]=True
+                    out.append(y)
+        else:
+            # Props de conteo se presentan como hitos positivos 1+/2+/3+, no como Over 2.5.
+            target=.60 if fam in {"hits","total_bases","hrr"} else .18
+            anchor=min(overs,key=lambda z:abs(float(z.get("prob",.5))-target))
+            y=dict(anchor); y["game_pk"]=game_pk or y.get("game_pk")
+            y["label"]=market_display_label_v765(y)
+            y["draftea_line_known"]=False; y["line_source"]="hito Draftea estimado"; y["needs_draftea_line"]=True
+            out.append(y)
+    return out
+
+def market_conflict_key_v765(item):
+    """Alternativas mutuamente excluyentes comparten llave y no ocupan dos lugares del Top."""
+    fam=str(item.get("market_family","") or "")
+    game=item.get("game_pk") or item.get("game")
+    subj=str(item.get("subject") or "").strip().lower()
+    if fam=="fg_ml": return (game,"fg_ml")
+    if fam in {"f5_total","fg_total"}: return (game,fam)
+    if fam in {"pitcher_k","hits","total_bases","hrr","home_run"}: return (game,fam,subj)
+    return (game,fam,str(item.get("label") or ""))
+
+def remove_market_conflicts_v765(items):
+    out=[]; seen=set()
+    for x in items:
+        k=market_conflict_key_v765(x)
+        if k in seen: continue
+        seen.add(k); out.append(x)
+    return out
+
 def confidence_score(item):
     p=item["prob"]
     low=item.get("prob_low",p)
@@ -1712,6 +1865,7 @@ def rank_automatic_candidates_v5(items,max_items=5):
     selected=[]
     prefix_counts={}
     cat_counts={}
+    conflict_keys=set()
     for item in ranked:
         label=item["label"]
         prefix=label
@@ -1723,7 +1877,11 @@ def rank_automatic_candidates_v5(items,max_items=5):
             continue
         if cat_counts.get(item["category"],0)>=2:
             continue
+        ckey=market_conflict_key_v765(item)
+        if ckey in conflict_keys:
+            continue
         selected.append(item)
+        conflict_keys.add(ckey)
         prefix_counts[prefix]=prefix_counts.get(prefix,0)+1
         cat_counts[item["category"]]=cat_counts.get(item["category"],0)+1
         if len(selected)>=max_items:
@@ -2380,11 +2538,14 @@ def rebuild_express_v762():
     fallback=[]
     if show_risky and len(chosen)<target_n:
         counts={}
+        used_conflicts={market_conflict_key_v765(z) for z in chosen}
         for z in chosen: counts[z.get("game")]=counts.get(z.get("game"),0)+1
         for z in near:
             if len(fallback)>=target_n-len(chosen): break
             if counts.get(z.get("game"),0)>=max_per_game: continue
-            fallback.append(z); counts[z.get("game")]=counts.get(z.get("game"),0)+1
+            ckey=market_conflict_key_v765(z)
+            if ckey in used_conflicts: continue
+            fallback.append(z); used_conflicts.add(ckey); counts[z.get("game")]=counts.get(z.get("game"),0)+1
     # Rebuild derived winner view too, so an edited ML line/side never leaves stale cards elsewhere.
     if "Full Game ML" in allowed_groups:
         _bw={}
@@ -2413,7 +2574,7 @@ def build_paper_record_v762(item,odds,stake_mxn,selected_date,games,source="MANU
     pid=hashlib.sha1(f"{item.get('game_pk')}|{item.get('label')}|{source}|{stamp.isoformat()}".encode()).hexdigest()[:12]
     return {
         "paper_id":pid,"timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.4.1","date":selected_date.isoformat(),
+        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.5","date":selected_date.isoformat(),
         "game_pk":int(item.get("game_pk",0) or 0),"game":item.get("game",pgame.get("label") if pgame else ""),
         "game_time_cdmx":format_game_time_cdmx(pgame.get("game_time_local")) if pgame else "",
         "away_abbr":pgame.get("away_abbr","") if pgame else "","home_abbr":pgame.get("home_abbr","") if pgame else "",
@@ -2461,7 +2622,7 @@ def build_parlay_paper_record_v764(legs,stake_mxn,selected_date,games,parlay_ind
     return {
         "paper_id":gid,"record_type":"PARLAY","paper_source":"PARLAY","paper_group_id":gid,
         "timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "model_version":"V7.6.4.1","date":selected_date.isoformat(),"game_pk":0,
+        "model_version":"V7.6.5","date":selected_date.isoformat(),"game_pk":0,
         "game":f"Parlay {parlay_index} · {len(leg_records)} selecciones",
         "game_time_cdmx":"Varios juegos","away_abbr":"","home_abbr":"",
         "market":f"PARLAY {len(leg_records)} LEGS","category":"Parlay","market_family":"parlay",
@@ -2543,8 +2704,8 @@ def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_g
     """V7.2.3: una sola familia no puede monopolizar Express."""
     allowed_groups=set(allowed_groups or ["F5 Carreras","Full Game ML","Full Game Carreras","Pitcher Ks","Batter props"])
     pool=[x for x in pool if market_group_v722(x) in allowed_groups]
-    if not automatic: return pool[:target_n]
-    selected=[]; game_counts={}; player_counts={}; group_counts={}
+    if not automatic: return remove_market_conflicts_v765(pool)[:target_n]
+    selected=[]; game_counts={}; player_counts={}; group_counts={}; conflict_keys=set()
     caps={
         "Pitcher Ks": min(2,max(1,math.ceil(target_n*.20))),
         "Batter props": max(1,math.ceil(target_n*.30)),
@@ -2568,7 +2729,9 @@ def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_g
                 game=x.get("game"); subj=x.get("subject","")
                 if game_counts.get(game,0)>=max_per_game: continue
                 if group in {"Pitcher Ks","Batter props"} and subj and player_counts.get(subj,0)>=1: continue
-                selected.append(x); progress=True
+                ckey=market_conflict_key_v765(x)
+                if ckey in conflict_keys: continue
+                selected.append(x); progress=True; conflict_keys.add(ckey)
                 game_counts[game]=game_counts.get(game,0)+1; group_counts[group]=group_counts.get(group,0)+1
                 if group in {"Pitcher Ks","Batter props"} and subj: player_counts[subj]=1
                 break
@@ -2650,6 +2813,7 @@ def analyze_game_express_v7(g,selected_date,allowed_groups=None):
 
     if "Pitcher Ks" in allowed or "Batter props" in allowed:
         pr=build_prop_candidates_v7(away_pitch,home_pitch,g['away_pitcher_name'],g['home_pitcher_name'],away_lineup,home_lineup,both,pf,weather)
+        pr=normalize_draftea_prop_candidates_v765(pr,g.get("game_pk"),d)
         if "Pitcher Ks" not in allowed: pr=[z for z in pr if z.get("market_family")!="pitcher_k"]
         if "Batter props" not in allowed: pr=[z for z in pr if z.get("market_family") not in {"hits","total_bases","hrr","home_run"}]
         items.extend(pr)
@@ -2668,10 +2832,10 @@ def analyze_game_express_v7(g,selected_date,allowed_groups=None):
     return ranked,{"quality":q,"both":both,"statcast":sc_count>0,"statcast_count":sc_count,"statcast_coverage":sc_cov}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.6.4.1", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.6.4.1 Alpha")
-st.caption("V7.6.4.1: Paper Parlays completos + Multi-Parlay independiente + edición/recalculo total + Pre-Bet Hardening + Statcast/Savant + calibración.")
-st.info("🎟️ **V7.6.4.1 ALPHA — PAPER PARLAYS COMPLETOS** — Mantiene Statcast/Savant de V7.5 y añade puertas de calidad más estrictas antes de marcar un pick como APOSTAR. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
+st.set_page_config(page_title="MLB Betting Hub V7.6.5", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.6.5 Alpha")
+st.caption("V7.6.5: normalización de mercados Draftea + memoria de líneas reales + exclusión de apuestas contradictorias + Paper Parlays completos.")
+st.info("🎯 **V7.6.5 ALPHA — DRAFTEA MARKET NORMALIZER** — Mantiene Statcast/Savant y añade un normalizador de mercados Draftea, memoria de líneas reales y exclusión de lados contradictorios antes de construir el Top. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -2773,6 +2937,7 @@ props=build_prop_candidates_v7(
     away_pitch,home_pitch,game["away_pitcher_name"],game["home_pitcher_name"],
     away_lineup,home_lineup,both_confirmed,park_factor,weather
 )
+props=normalize_draftea_prop_candidates_v765(props,game.get("game_pk"),selected_date.isoformat())
 
 # =========================
 # Contexto visible
@@ -2971,6 +3136,8 @@ for side,abbr in [("away",game["away_abbr"]),("home",game["home_abbr"])]:
     })
 
 automatic.extend(props)
+for _z in automatic:
+    _z.setdefault("game_pk",game.get("game_pk")); _z.setdefault("game",game.get("label"))
 automatic=[apply_market_calibration_v75(z) for z in automatic]
 for _z in automatic:
     _z["market_reliability"]=market_reliability_v74(_z)
@@ -3066,6 +3233,24 @@ with tab1:
             st.caption(item["reason"])
             risk,ricon=risk_profile_v72(item)
             st.caption(f"{ricon} Riesgo {risk} · {item.get('reason','')}")
+            if item.get("market_family") in {"pitcher_k","hits","total_bases","hrr","home_run"}:
+                if item.get("draftea_line_known"):
+                    st.caption("✅ Este análisis ya usa la línea real de Draftea recordada.")
+                else:
+                    st.caption("🟠 Línea estimada: indica la línea real de Draftea y vuelve a analizar.")
+                with st.expander(f"✏️ Ajustar línea Draftea · {item.get('subject','')}",expanded=False):
+                    _ifam=item.get("market_family")
+                    if _ifam in {"hits","total_bases","hrr","home_run"}:
+                        _idef=max(1,int(math.floor(float(item.get("line",.5)))+1))
+                        _ithr=int(st.number_input("Objetivo Draftea (1+, 2+, 3+ …)",min_value=1,max_value=10,value=_idef,step=1,key=f"v765_game_thr_{game['game_pk']}_{i}_{_ifam}"))
+                        _iline=float(_ithr)-.5
+                    else:
+                        _iline=st.number_input("Línea Draftea",value=float(item.get("line",4.5)),step=.5,key=f"v765_game_line_{game['game_pk']}_{i}_{_ifam}")
+                    if st.button("💾 Guardar línea y recalcular partido",key=f"v765_game_save_{game['game_pk']}_{i}_{_ifam}",use_container_width=True):
+                        save_draftea_line_v765(item,float(_iline),selected_date.isoformat())
+                        st.session_state["v653_analysis_ready"]=True
+                        st.success("Línea Draftea guardada. El partido se recalculará usando esa línea para este jugador/mercado.")
+                        st.rerun()
 
         if analysis_summary["near"]:
             st.markdown("### 🟡 Cerca de calificar")
@@ -3165,9 +3350,23 @@ with tabExpress:
         default=["F5 Carreras","Full Game ML","Full Game Carreras"],
         help="F5 analiza solo carreras Over/Under. En Full Game puedes elegir por separado ganador (ML) y carreras Over/Under. Pitcher Ks y Batter props son opcionales."
     )
-    max_per_game=int(st.number_input("Máximo de selecciones por partido",min_value=1,max_value=3,value=1,step=1,help="Permite hasta 1, 2 o 3 selecciones del mismo juego dentro del Top."))
+    max_per_game=int(st.number_input("Máximo de selecciones por partido",min_value=1,max_value=3,value=1,step=1,help="Permite hasta 1, 2 o 3 selecciones del mismo juego. V7.6.5 nunca ocupa dos lugares con lados contradictorios del mismo mercado."))
     show_risky=st.toggle("Si no hay suficientes verdes, mostrar las mejores alternativas con riesgo",value=True,help="No las marca como seguras: simplemente muestra las de mayor probabilidad disponible con su nivel de riesgo y confianza.")
     st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si faltan picks verdes, puedes ver el mejor Top disponible aunque incluya riesgo.")
+    _saved_lines=draftea_line_overrides_v765()
+    _today_prefix=selected_date.isoformat()+"|"
+    _today_saved={k:v for k,v in _saved_lines.items() if str(k).startswith(_today_prefix)}
+    if _today_saved:
+        with st.expander(f"📌 Líneas Draftea recordadas hoy ({len(_today_saved)})",expanded=False):
+            st.caption("Estas líneas NO fijan apuestas: solo indican qué línea existe realmente. El modelo vuelve a recalcular y rankear todo con ellas.")
+            for _k,_v in list(_today_saved.items()):
+                _parts=_k.split("|",3); _fam=_parts[2] if len(_parts)>2 else ""; _subj=_parts[3] if len(_parts)>3 else ""
+                _ln=float((_v or {}).get("line",0))
+                _show=(f"{int(math.floor(_ln)+1)}+" if _fam in {"hits","total_bases","hrr","home_run"} else f"{_ln:g}")
+                st.write(f"• {_subj.title()} · {_fam} → {_show}")
+            if st.button("🧹 Borrar todas las líneas recordadas de hoy",key="v765_clear_today_lines"):
+                rows={k:v for k,v in _saved_lines.items() if not str(k).startswith(_today_prefix)}
+                st.session_state["v765_draftea_market_lines"]=rows; _write_draftea_lines_v765(rows); st.rerun()
 
     nowx=now_cdmx()
     future_games=[g for g in games if game_is_pregame(g,nowx)]
@@ -3241,11 +3440,15 @@ with tabExpress:
             ranked_near=sorted(near,key=lambda z:(z.get("prob_low",0),z.get("confidence_score",0),z.get("prob",0)),reverse=True)
             existing=list(chosen)
             game_counts={}
+            used_conflicts={market_conflict_key_v765(z) for z in existing}
             for z in existing: game_counts[z.get("game")]=game_counts.get(z.get("game"),0)+1
             for z in ranked_near:
                 if len(fallback)>=needed: break
                 if game_counts.get(z.get("game"),0)>=max_per_game: continue
+                ckey=market_conflict_key_v765(z)
+                if ckey in used_conflicts: continue
                 fallback.append(z)
+                used_conflicts.add(ckey)
                 game_counts[z.get("game")]=game_counts.get(z.get("game"),0)+1
         shown_all=chosen+fallback
         # Mejor ganador por partido (Full Game ML preferido; F5 ML si Full Game no está habilitado).
@@ -3351,6 +3554,11 @@ with tabExpress:
                 m6.metric("Riesgo",f"{ricon} {risk}")
                 if x.get("line_repriced"):
                     st.caption(f"🔄 Línea de mercado detectada y recalculada: {float(x.get('original_model_line')):g} → {float(x.get('line')):g}.")
+                if x.get("market_family") in {"pitcher_k","hits","total_bases","hrr","home_run"}:
+                    if x.get("draftea_line_known"):
+                        st.caption("✅ Línea real de Draftea recordada para este jugador/mercado.")
+                    elif x.get("needs_draftea_line"):
+                        st.caption("🟠 Línea estimada por el modelo. Confírmala una vez con Draftea; después se reutiliza en nuevas búsquedas.")
                 if x.get("reference_odds"):
                     st.caption(f"🌐 Ref. {x['reference_odds']:.2f}x · mínimo modelo {x.get('reference_target_odds',x.get('model_target_odds',0)):.2f}x · EV conservador {x.get('reference_ev_cons',0)*100:+.1f}% · {x.get('reference_books',0)} casas")
                 else:
@@ -3358,9 +3566,9 @@ with tabExpress:
                 if x.get("reason"): st.caption("📌 "+x["reason"])
                 _gate=x.get("prebet_gate_v76") or prebet_quality_gate_v76(x,st.session_state.get("v721_use_odds",False))
                 if _gate.get("pass"):
-                    st.caption(f"🛡️ Gate V7.6.4.1: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
+                    st.caption(f"🛡️ Gate V7.6.5: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
                 else:
-                    st.caption("🛡️ Gate V7.6.4.1: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
+                    st.caption("🛡️ Gate V7.6.5: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
                 _cal=x.get("calibration_v75") or {}
                 if _cal.get("active"):
                     st.caption(f"🎯 Calibración histórica activa: N={_cal.get('n')} · ajuste {float(_cal.get('delta',0))*100:+.1f} pp (limitado y regresado).")
@@ -3369,8 +3577,17 @@ with tabExpress:
                 if x.get("sample_values") is not None:
                     with st.expander("✏️ Draftea tiene otra línea / editar esta apuesta"):
                         c1,c2,c3=st.columns(3)
-                        side=c1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"v72_side_{x['game_pk']}_{i}")
-                        line=c2.number_input("Línea disponible en Draftea",value=float(x.get("line",.5)),step=.5,key=f"v72_line_{x['game_pk']}_{i}")
+                        _fam=str(x.get("market_family","") or "")
+                        _count_market=_fam in {"hits","total_bases","hrr","home_run"}
+                        if _count_market:
+                            side="over"
+                            c1.caption("Draftea usa hitos: 1+, 2+, 3+ …")
+                            _default_thr=max(1,int(math.floor(float(x.get("line",.5)))+1))
+                            _thr=int(c2.number_input("Objetivo disponible en Draftea",min_value=1,max_value=10,value=_default_thr,step=1,key=f"v72_thr_{x['game_pk']}_{i}_{_fam}"))
+                            line=float(_thr)-.5
+                        else:
+                            side=c1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"v72_side_{x['game_pk']}_{i}")
+                            line=c2.number_input("Línea disponible en Draftea",value=float(x.get("line",.5)),step=.5,key=f"v72_line_{x['game_pk']}_{i}")
                         default_od=float(x.get("reference_odds") or 1.80)
                         od=c3.number_input("Momio Draftea",min_value=1.01,max_value=20.0,value=default_od,step=.01,format="%.2f",key=f"v72_odds_{x['game_pk']}_{i}")
                         rx=v7_reprice_line(x,line,side)
@@ -3383,24 +3600,39 @@ with tabExpress:
                             z4.metric("EV cons.",f"{pm['ev_cons']*100:+.1f}%")
                             z5.metric("Riesgo",f"{ri} {rr}")
                             icon="🟢" if pm["verdict"]=="APOSTAR" else "🟡" if pm["verdict"]=="CANDIDATO" else "⚪"
-                            st.markdown(f"**{icon} {pm['verdict']} con la línea {line:g} @ {od:.2f}x**")
+                            _shown_line=(f"{int(math.floor(line)+1)}+" if _count_market else f"{line:g}")
+                            st.markdown(f"**{icon} {pm['verdict']} con la línea {_shown_line} @ {od:.2f}x**")
                             st.caption("La probabilidad fue recalculada para ESTA línea; nunca se reutiliza la probabilidad de la línea original.")
+                            if x.get("draftea_line_known") and st.button("🗑️ Olvidar línea Draftea guardada",key=f"v765_forget_{x['game_pk']}_{i}",use_container_width=True):
+                                delete_draftea_line_v765(x,selected_date.isoformat())
+                                st.success("Línea olvidada. La próxima búsqueda volverá a estimarla hasta que indiques la nueva línea real.")
+                                st.rerun()
                             if st.button("🔄 Aplicar cambio y actualizar TODO Express",key=f"v721_apply_{x['game_pk']}_{i}",use_container_width=True):
                                 rx["manual_line_edited"]=True
                                 rx["reference_odds"]=None
                                 rx["reference_ev_cons"]=None
+                                rx["label"]=market_display_label_v765(rx)
+                                rx["draftea_line_known"]=True; rx["line_source"]="Draftea manual"; rx["needs_draftea_line"]=False
+                                save_draftea_line_v765(x,float(line),selected_date.isoformat())
                                 rx=refresh_pick_v762(rx,use_odds=False,manual_odds=float(od))
-                                old_key=(x.get("game_pk"),x.get("label"))
-                                pool=list(st.session_state.get("v762_express_prepool",[]))
-                                found=False
-                                for kk,z in enumerate(pool):
-                                    if (z.get("game_pk"),z.get("label"))==old_key:
-                                        pool[kk]=rx; found=True; break
-                                if not found:
+                                # Borra líneas teóricas de ese jugador+mercado y reconstruye con la línea real.
+                                pool=[]
+                                for z in st.session_state.get("v762_express_prepool",[]):
+                                    same=(int(z.get("game_pk",0) or 0)==int(x.get("game_pk",0) or 0) and z.get("market_family")==x.get("market_family") and str(z.get("subject"))==str(x.get("subject")))
+                                    if not same: pool.append(z)
+                                fam=x.get("market_family")
+                                if fam=="pitcher_k":
+                                    for sside in ["over","under"]:
+                                        rz=v7_reprice_line(x,float(line),sside)
+                                        if rz:
+                                            rz["game_pk"]=x.get("game_pk"); rz["game"]=x.get("game"); rz["label"]=market_display_label_v765(rz)
+                                            rz["manual_line_edited"]=True; rz["draftea_line_known"]=True; rz["line_source"]="Draftea manual"; rz["needs_draftea_line"]=False
+                                            pool.append(refresh_pick_v762(rz,use_odds=False,manual_odds=float(od) if sside==side else None))
+                                else:
                                     pool.append(rx)
                                 st.session_state["v762_express_prepool"]=pool
                                 rebuild_express_v762()
-                                st.success("Cambio aplicado. Recalculé probabilidad, conservadora, confianza, riesgo, Bet Quality, Gate y el ranking completo de Express con la nueva línea/momio.")
+                                st.success("Línea Draftea guardada. Recalculé TODO el mercado y el ranking; al volver a buscar Express se reutilizará esta línea real.")
                                 st.rerun()
 
                 with st.expander("🧪 Guardar esta selección en Paper Bets"):
@@ -3442,7 +3674,7 @@ with tabParlay:
     parlay_use_odds=po2.toggle("Usar momios de referencia",value=False,key="v763_parlay_use_odds",help="Si está apagado, Mayor ganancia usa el momio mínimo orientativo del modelo. Si está encendido, intenta usar cuotas de referencia y puede consumir créditos de The Odds API.")
 
     if parlay_profile=="Menor riesgo":
-        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.4.1. Si no alcanza la calidad, puede entregar menos parlays o menos piernas.")
+        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.5. Si no alcanza la calidad, puede entregar menos parlays o menos piernas.")
     elif parlay_profile=="Equilibrado":
         st.info("⚖️ Equilibrado: combina probabilidad/solidez con una cuota razonable. Puede usar picks amarillos fuertes para completar tickets, siempre identificados como riesgo.")
     else:
@@ -3619,8 +3851,16 @@ with tabParlay:
                     if x.get("sample_values") is not None:
                         with st.expander(f"✏️ Editar Parlay {pidx} · pierna {i}: línea / lado / momio",expanded=False):
                             ec1,ec2,ec3=st.columns(3)
-                            eside=ec1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"{keybase}_side")
-                            eline=ec2.number_input("Línea Draftea",value=float(x.get("line",.5)),step=.5,key=f"{keybase}_line")
+                            _pfam=str(x.get("market_family","") or "")
+                            _pcount=_pfam in {"hits","total_bases","hrr","home_run"}
+                            if _pcount:
+                                eside="over"
+                                ec1.caption("Draftea: 1+, 2+, 3+ …")
+                                _pthr=int(ec2.number_input("Objetivo Draftea",min_value=1,max_value=10,value=max(1,int(math.floor(float(x.get("line",.5)))+1)),step=1,key=f"{keybase}_thr"))
+                                eline=float(_pthr)-.5
+                            else:
+                                eside=ec1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"{keybase}_side")
+                                eline=ec2.number_input("Línea Draftea",value=float(x.get("line",.5)),step=.5,key=f"{keybase}_line")
                             eodd=ec3.number_input("Momio Draftea",min_value=1.01,max_value=100.0,value=float(round(default_odd,2)),step=.01,key=f"{keybase}_odd")
                             preview=v7_reprice_line(x,eline,eside)
                             if preview:
@@ -3638,6 +3878,10 @@ with tabParlay:
                         if base.get("sample_values") is not None and spec.get("line") is not None:
                             y=v7_reprice_line(base,float(spec["line"]),spec.get("side") or base.get("side","over")) or dict(base)
                             y["manual_line_edited"]=bool(float(spec["line"])!=float(base.get("line",spec["line"])) or spec.get("side")!=base.get("side"))
+                            if base.get("market_family") in {"pitcher_k","hits","total_bases","hrr","home_run"}:
+                                save_draftea_line_v765(base,float(spec["line"]),selected_date.isoformat())
+                                y["draftea_line_known"]=True; y["line_source"]="Draftea manual"; y["needs_draftea_line"]=False
+                                y["label"]=market_display_label_v765(y)
                         else:
                             y=dict(base)
                         y["reference_odds"]=None if y.get("manual_line_edited") else y.get("reference_odds")
@@ -3690,7 +3934,7 @@ with tab2:
     if not source_candidates:
         st.info("Primero ejecuta **⚡ Express** o analiza un partido individual.")
     else:
-        # Hotfix V7.6.4.1: algunos candidatos nuevos pueden traer `market`/`subject`
+        # Hotfix V7.6.5: algunos candidatos nuevos pueden traer `market`/`subject`
         # en lugar de `label`. Normalizamos el texto antes de pintar la UI para
         # evitar KeyError sin cambiar el modelo ni la evaluación de momios.
         def _eval_market_label(x):

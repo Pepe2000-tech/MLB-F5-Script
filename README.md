@@ -1,54 +1,68 @@
-# MLB Betting Hub V7.6.4.1 Alpha — Hotfix Evaluar Momios
+# MLB Betting Hub V7.6.5 Alpha — Draftea Market Normalizer
 
-V7.6.4.1 mantiene Paper Parlays completos y corrige un KeyError en Evaluar momios cuando un candidato no trae el campo `label`. La interfaz ahora normaliza `label`, `market`, `subject`, lado y línea sin cambiar el modelo de apuestas.
+V7.6.5 reconstruye la capa de mercados de jugador/pitcher para que el modelo deje de premiar líneas teóricas extremas que no corresponden a lo que el usuario realmente ve en Draftea.
 
-## Cambio principal
+## Cambios principales
 
-Un parlay guardado desde la pestaña **Parlays** ahora se registra como **una sola Paper Bet completa**, no como varias apuestas individuales.
+### 1. Memoria de líneas reales de Draftea
+Cuando corriges una línea de Pitcher Ks o un prop de bateador, la app guarda la línea por fecha + partido + jugador + familia de mercado.
 
-El registro padre conserva internamente todas sus piernas para poder resolverlas con MLB, pero el monto apostado, resultado, ROI, ganancia/pérdida y conteo de apuestas se contabilizan una sola vez.
+Ejemplo:
 
-### Ejemplo
+- Modelo estimado: Pitcher X Over 6.5 K
+- Draftea real: 3.5 K
+- V7.6.5 guarda Pitcher X / Ks = 3.5
+- Al volver a ejecutar Express o analizar el partido, se recalculan Over y Under usando 3.5. Ya no reaparecen 4.5, 5.5 o 6.5 para ese mismo jugador/mercado durante esa jornada.
 
-Un parlay de 4 selecciones y $50 MXN se guarda como:
+La línea guardada NO fija la apuesta. El pick vuelve a competir contra todos los demás con su nueva probabilidad, confianza, Bet Quality, Gate y ranking.
 
-- 1 Paper Bet
-- Momio combinado del ticket
-- $50 MXN apostados una sola vez
-- Retorno potencial del parlay completo
-- 4 piernas embebidas para liquidación
+### 2. Pitcher Ks sin línea conocida
+Mientras todavía no se ha informado la línea de Draftea, el motor deja de meter todas las líneas alternas al ranking. Usa una sola línea central estimada y la marca como pendiente de confirmación.
 
-En Paper Bets puede expandirse con **Ver N selecciones** para revisar cada pierna y su estado.
+Esto evita recomendaciones como Under 7.5 únicamente porque una línea extrema produce una probabilidad artificialmente alta.
 
-## Liquidación
+### 3. Props de bateador en lenguaje Draftea
+Hits, Total Bases, HRR y Home Run se presentan como hitos enteros:
 
-- Si cualquier pierna pierde, el parlay completo queda LOST.
-- Si todavía faltan partidos y ninguna pierna perdió, queda PENDING.
-- Los PUSH no cuentan como derrota.
-- Si todas las piernas restantes ganan y no hay pendientes, el parlay queda WON.
-- Si todas fueran PUSH, queda PUSH.
+- 1+ Hits
+- 2+ Hits
+- 3+ Hits
 
-## Rendimiento
+Internamente el modelo sigue calculando con la distribución completa. Por ejemplo, 3+ Hits corresponde matemáticamente a superar 2.5, pero la interfaz ya no obliga al usuario a traducirlo.
 
-Los parlays nuevos cuentan como una sola apuesta en Rendimiento, por lo que no inflan artificialmente número de apuestas, stake, ROI ni hit rate.
+### 4. Exclusión de apuestas contradictorias
+El Top ya no puede utilizar dos lugares para lados mutuamente excluyentes del mismo mercado.
 
-## CSV
+Ejemplo:
 
-Las piernas y sus resultados se exportan como JSON dentro del CSV (`legs_json` y `leg_results_json`) y se restauran al importar el archivo.
+- Yankees Full Game ML
+- Red Sox Full Game ML
 
-## Se mantiene de V7.6.3
+El modelo puede calcular ambos, pero solo el mejor lado puede aparecer como selección del Top. Si se solicitan dos apuestas, la segunda debe venir de otro mercado compatible o de otro partido; si no hay suficiente calidad, se muestran menos selecciones.
 
-- Multi-Parlays independientes de Express.
-- 1–5 parlays por búsqueda.
-- 2–8 juegos por parlay.
+También se evita duplicar Over/Under del mismo total y múltiples alternativas del mismo jugador + familia de mercado.
+
+### 5. Express y Partido usan las mismas líneas
+Las líneas guardadas se aplican tanto en Express como al analizar un partido individual. En Partido se añadió un control para informar la línea Draftea y recalcular.
+
+### 6. Parlays alineados
+Los parlays utilizan el mismo normalizador porque nacen del mismo motor de jornada. Al editar un prop en Parlay también se recuerda la línea Draftea para posteriores análisis de esa jornada.
+
+### 7. Momios de referencia no pisan Draftea
+Si una línea real de Draftea ya fue informada y la API de momios de referencia encuentra una línea distinta, V7.6.5 conserva Draftea. La referencia externa no sustituye silenciosamente la línea manual.
+
+## Se mantiene de V7.6.4.1
+
+- Paper Parlays completos: un parlay = una Paper Bet.
+- Multi-Parlays independientes.
 - Perfiles Menor riesgo / Equilibrado / Mayor ganancia.
-- Mercados seleccionables.
-- Edición de líneas y momios con recálculo total.
 - Paper Bets individuales desde Express.
 - Eliminación individual de Paper Bets.
-- Statcast/Savant, Bet Quality, calibración y Gate de calidad.
-- Exclusión de partidos iniciados/Final en nuevas búsquedas.
+- Statcast/Savant.
+- Bet Quality, calibración y Pre-Bet Gate.
+- Exclusión de juegos iniciados/finalizados.
+- Hotfix de Evaluar Momios.
 
-## Persistencia
+## Persistencia de líneas
 
-El respaldo local sigue funcionando durante la misma instancia de Streamlit. Para persistencia tras reinicios/redeploys, configura Supabase con los Secrets ya utilizados en versiones anteriores.
+Las líneas Draftea se guardan en memoria de sesión y en un respaldo local de la instancia Streamlit. Esto permite reutilizarlas al volver a ejecutar Express durante la jornada en la misma instancia. No se considera almacenamiento permanente tras un redeploy/reinicio del servidor.
