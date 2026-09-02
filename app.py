@@ -14,7 +14,7 @@ import streamlit as st
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.2"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/7.6.4"}
 CDMX_TZ=ZoneInfo("America/Mexico_City")
 
 def now_cdmx():
@@ -2131,6 +2131,10 @@ def settle_market_v65(record, result):
     return "UNSUPPORTED","Mercado todavía no tiene resolución automática"
 
 def normalize_paper_row(row):
+    for _json_field,_target in [("legs_json","legs"),("leg_results_json","leg_results")]:
+        if row.get(_json_field) and not row.get(_target):
+            try: row[_target]=json.loads(row.get(_json_field))
+            except Exception: row[_target]=[]
     numeric_float=["prob_central","prob_low","prob_high","agreement","odds","stake","stake_mxn","unit_value_mxn","hours_to_game_at_freeze"]
     numeric_int=["confidence","game_pk","away_lineup_count","home_lineup_count"]
     for k in numeric_float:
@@ -2409,7 +2413,7 @@ def build_paper_record_v762(item,odds,stake_mxn,selected_date,games,source="MANU
     pid=hashlib.sha1(f"{item.get('game_pk')}|{item.get('label')}|{source}|{stamp.isoformat()}".encode()).hexdigest()[:12]
     return {
         "paper_id":pid,"timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.2","date":selected_date.isoformat(),
+        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.4","date":selected_date.isoformat(),
         "game_pk":int(item.get("game_pk",0) or 0),"game":item.get("game",pgame.get("label") if pgame else ""),
         "game_time_cdmx":format_game_time_cdmx(pgame.get("game_time_local")) if pgame else "",
         "away_abbr":pgame.get("away_abbr","") if pgame else "","home_abbr":pgame.get("home_abbr","") if pgame else "",
@@ -2432,6 +2436,73 @@ def save_paper_record_v762(rec):
     st.session_state.setdefault("v653_paper_bets",[])
     st.session_state["v653_paper_bets"].append(rec)
     return persistent_upsert_paper_bet(rec)
+
+
+def build_parlay_paper_record_v764(legs,stake_mxn,selected_date,games,parlay_index=1):
+    """Store a complete parlay as ONE Paper Bet while preserving every leg for settlement."""
+    stamp=now_cdmx()
+    gid="PAR-"+hashlib.sha1(f"{selected_date}|{parlay_index}|{stamp.isoformat()}".encode()).hexdigest()[:10]
+    leg_records=[]
+    combined=1.0; joint=1.0
+    all_final=True
+    for x in legs:
+        pod=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.80)
+        lr=build_paper_record_v762(x,pod,stake_mxn,selected_date,games,source="PARLAY_LEG",group_id=gid)
+        # Legs live only inside the parent ticket; the stake is NOT counted per leg.
+        lr["stake_mxn"]=0.0; lr["stake"]=0.0
+        lr["paper_parent_id"]=gid
+        leg_records.append(lr)
+        combined*=pod
+        joint*=float(x.get("prob_low",x.get("prob",0)) or 0)
+        all_final=all_final and bool(lr.get("both_lineups_confirmed"))
+    confs=[int(x.get("confidence",0) or 0) for x in leg_records]
+    qualities=[int(x.get("data_quality",0) or 0) for x in leg_records]
+    bqs=[int(x.get("bet_quality_score",0) or 0) for x in leg_records]
+    return {
+        "paper_id":gid,"record_type":"PARLAY","paper_source":"PARLAY","paper_group_id":gid,
+        "timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
+        "model_version":"V7.6.4","date":selected_date.isoformat(),"game_pk":0,
+        "game":f"Parlay {parlay_index} · {len(leg_records)} selecciones",
+        "game_time_cdmx":"Varios juegos","away_abbr":"","home_abbr":"",
+        "market":f"PARLAY {len(leg_records)} LEGS","category":"Parlay","market_family":"parlay",
+        "odds":round(combined,4),"stake":round(float(stake_mxn/50.0),4),"stake_mxn":round(float(stake_mxn),2),"unit_value_mxn":50.0,
+        "prob_central":round(joint,6),"prob_low":round(joint,6),"prob_high":round(joint,6),
+        "confidence":min(confs) if confs else 0,"data_quality":min(qualities) if qualities else 0,
+        "bet_quality_score":min(bqs) if bqs else 0,"market_reliability":min([int(x.get("market_reliability",0) or 0) for x in leg_records] or [0]),
+        "confirmed":all_final,"both_lineups_confirmed":all_final,"freeze_type":"FINAL" if all_final else "PRELIMINARY",
+        "readiness":"GREEN" if all_final else "YELLOW","readiness_level":"GREEN" if all_final else "YELLOW",
+        "status":"FROZEN","result":"PENDING","settlement_note":"","legs":leg_records,
+        "leg_count":len(leg_records),"manual_line_edited":any(bool(x.get("manual_line_edited")) for x in leg_records)
+    }
+
+def settle_parlay_record_v764(record):
+    """Settle the parent parlay from its embedded legs. A lost leg loses the ticket; pushes reduce leg count."""
+    legs=record.get("legs") or []
+    if not isinstance(legs,list) or not legs:
+        return "UNSUPPORTED","Parlay sin piernas guardadas",[]
+    leg_states=[]; any_pending=False; any_lost=False; won_count=push_count=0
+    for leg in legs:
+        gr=get_game_result_v65(leg.get("game_pk"))
+        if not gr.get("final"):
+            verdict,note="PENDING","Partido aún no finaliza"
+            any_pending=True
+        else:
+            verdict,note=settle_market_v65(leg,gr)
+            if verdict=="LOST": any_lost=True
+            elif verdict=="WON": won_count+=1
+            elif verdict=="PUSH": push_count+=1
+            elif verdict in ("PENDING","UNSUPPORTED"): any_pending=True
+        leg_states.append({"game":leg.get("game"),"market":leg.get("market"),"odds":leg.get("odds"),"result":verdict,"note":note})
+    if any_lost:
+        overall="LOST"
+    elif any_pending:
+        overall="PENDING"
+    elif won_count==0 and push_count==len(legs):
+        overall="PUSH"
+    else:
+        overall="WON"
+    note=f"{won_count} ganadas · {sum(x['result']=='LOST' for x in leg_states)} perdidas · {push_count} push · {sum(x['result']=='PENDING' for x in leg_states)} pendientes"
+    return overall,note,leg_states
 
 def market_group_v722(item):
     """V7.5: familias concretas para que Express analice exactamente lo elegido."""
@@ -2597,10 +2668,10 @@ def analyze_game_express_v7(g,selected_date,allowed_groups=None):
     return ranked,{"quality":q,"both":both,"statcast":sc_count>0,"statcast_count":sc_count,"statcast_coverage":sc_cov}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.6.2", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.6.2 Alpha")
-st.caption("V7.6.2: Paper Bets integrados + edición/recalculo total en Express y Parlays + Pre-Bet Hardening + Statcast/Savant + calibración.")
-st.info("🧪 **V7.6.2 ALPHA — PAPER BETS + LIVE RECALC** — Mantiene Statcast/Savant de V7.5 y añade puertas de calidad más estrictas antes de marcar un pick como APOSTAR. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
+st.set_page_config(page_title="MLB Betting Hub V7.6.4", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.6.4 Alpha")
+st.caption("V7.6.4: Paper Parlays completos + Multi-Parlay independiente + edición/recalculo total + Pre-Bet Hardening + Statcast/Savant + calibración.")
+st.info("🎟️ **V7.6.4 ALPHA — PAPER PARLAYS COMPLETOS** — Mantiene Statcast/Savant de V7.5 y añade puertas de calidad más estrictas antes de marcar un pick como APOSTAR. Un mercado puede tener buena probabilidad y aun así quedar en REVISAR si faltan lineup, calidad de datos, cobertura Statcast crítica o estabilidad suficiente.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -3287,9 +3358,9 @@ with tabExpress:
                 if x.get("reason"): st.caption("📌 "+x["reason"])
                 _gate=x.get("prebet_gate_v76") or prebet_quality_gate_v76(x,st.session_state.get("v721_use_odds",False))
                 if _gate.get("pass"):
-                    st.caption(f"🛡️ Gate V7.6.2: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
+                    st.caption(f"🛡️ Gate V7.6.4: APOSTAR · Statcast lineup {float(x.get('statcast_coverage',0))*100:.0f}%")
                 else:
-                    st.caption("🛡️ Gate V7.6.2: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
+                    st.caption("🛡️ Gate V7.6.4: REVISAR · " + " · ".join(_gate.get("reasons",[])[:4]))
                 _cal=x.get("calibration_v75") or {}
                 if _cal.get("active"):
                     st.caption(f"🎯 Calibración histórica activa: N={_cal.get('n')} · ajuste {float(_cal.get('delta',0))*100:+.1f} pp (limitado y regresado).")
@@ -3351,38 +3422,41 @@ with tabExpress:
 
 with tabParlay:
     st.subheader("🎟️ Parlays independientes — toda la jornada")
-    st.caption("Este módulo NO depende de Express. Cada búsqueda revisa todos los partidos de la fecha, excluye juegos ya iniciados y construye un parlay nuevo según tus mercados, número de juegos y perfil.")
+    st.caption("Este módulo NO depende de Express. Puedes pedir 1 a 5 parlays; cada búsqueda vuelve a revisar toda la jornada, excluye juegos ya iniciados y arma cada ticket según tus mercados, número de juegos y perfil.")
 
-    pc1,pc2,pc3=st.columns(3)
-    parlay_legs=int(pc1.number_input("¿Cuántos juegos tendrá el parlay?",min_value=2,max_value=8,value=3,step=1,key="v761_parlay_legs"))
-    parlay_profile=pc2.selectbox("Perfil del parlay",["Menor riesgo","Equilibrado","Mayor ganancia"],index=1,key="v761_parlay_profile")
-    parlay_lineups=pc3.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0,key="v761_parlay_lineups")
+    pc1,pc2,pc3,pc4=st.columns(4)
+    parlay_count=int(pc1.number_input("¿Cuántos parlays quieres?",min_value=1,max_value=5,value=1,step=1,key="v763_parlay_count"))
+    parlay_legs=int(pc2.number_input("Juegos por parlay",min_value=2,max_value=8,value=3,step=1,key="v763_parlay_legs"))
+    parlay_profile=pc3.selectbox("Perfil del parlay",["Menor riesgo","Equilibrado","Mayor ganancia"],index=1,key="v763_parlay_profile")
+    parlay_lineups=pc4.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0,key="v763_parlay_lineups")
 
     parlay_market_choices=st.multiselect(
-        "Mercados a analizar para el parlay",
+        "Mercados a analizar para los parlays",
         ["F5 Carreras","Full Game ML","Full Game Carreras","Pitcher Ks","Hits","Total Bases","HRR","Home Run"],
         default=["F5 Carreras","Full Game ML","Full Game Carreras"],
-        key="v761_parlay_markets",
-        help="Puedes mezclar mercados. El constructor intenta usar un solo pick por juego para que el número de piernas coincida con el número de partidos."
+        key="v763_parlay_markets",
+        help="Puedes mezclar mercados. Cada parlay usa como máximo una selección por partido."
     )
-    parlay_use_odds=st.toggle("Usar momios de referencia para construir el parlay",value=False,key="v761_parlay_use_odds",help="Si está apagado, el perfil Mayor ganancia usa el momio mínimo orientativo del modelo. Si está encendido, intenta usar cuotas de referencia y puede consumir créditos de The Odds API.")
+    po1,po2=st.columns(2)
+    parlay_avoid_repeat=po1.toggle("Evitar repetir la misma selección entre parlays",value=True,key="v763_parlay_avoid_repeat",help="Activado: una apuesta exacta no se reutiliza en otro parlay. El mismo partido sí puede aparecer con otro mercado si el modelo encuentra una opción distinta.")
+    parlay_use_odds=po2.toggle("Usar momios de referencia",value=False,key="v763_parlay_use_odds",help="Si está apagado, Mayor ganancia usa el momio mínimo orientativo del modelo. Si está encendido, intenta usar cuotas de referencia y puede consumir créditos de The Odds API.")
 
     if parlay_profile=="Menor riesgo":
-        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.2. Evita picks volátiles aunque reduzca la ganancia potencial.")
+        st.info("🛡️ Menor riesgo: prioriza probabilidad conservadora, confianza, Bet Quality y Gate V7.6.4. Si no alcanza la calidad, puede entregar menos parlays o menos piernas.")
     elif parlay_profile=="Equilibrado":
-        st.info("⚖️ Equilibrado: combina probabilidad/solidez con una cuota razonable. Puede usar picks amarillos fuertes si no alcanza con verdes.")
+        st.info("⚖️ Equilibrado: combina probabilidad/solidez con una cuota razonable. Puede usar picks amarillos fuertes para completar tickets, siempre identificados como riesgo.")
     else:
-        st.warning("💰 Mayor ganancia: aumenta el peso del momio potencial, pero mantiene un piso de calidad para no convertir el parlay en una combinación puramente especulativa.")
+        st.warning("💰 Mayor ganancia: aumenta el peso del momio potencial, pero conserva pisos mínimos de probabilidad y calidad; no busca combinaciones puramente especulativas.")
 
     nowp=now_cdmx()
     parlay_future=[g for g in games if game_is_pregame(g,nowp)]
-    pp1,pp2,pp3=st.columns(3)
+    pp1,pp2,pp3,pp4=st.columns(4)
     pp1.metric("Partidos de la jornada",len(games))
     pp2.metric("Aún no iniciados",len(parlay_future))
-    pp3.metric("Juegos solicitados",parlay_legs)
+    pp3.metric("Parlays solicitados",parlay_count)
+    pp4.metric("Juegos por parlay",parlay_legs)
 
-    if st.button("🎟️ Buscar parlay en toda la jornada",type="primary",use_container_width=True,key="v761_build_independent_parlay"):
-        # Mapea controles granulares a los grupos que entiende el motor Express.
+    if st.button("🎟️ Buscar parlays en toda la jornada",type="primary",use_container_width=True,key="v763_build_independent_parlays"):
         engine_groups=[]
         if "F5 Carreras" in parlay_market_choices: engine_groups.append("F5 Carreras")
         if "Full Game ML" in parlay_market_choices: engine_groups.append("Full Game ML")
@@ -3426,7 +3500,6 @@ with tabParlay:
             aprog.progress((i+1)/max(1,len(eligible)),text=f"Analizados {i+1}/{len(eligible)}")
         aprog.empty()
 
-        # Enriquece calidad, riesgo, gate y opcionalmente momios.
         enriched=[]
         for x in candidates:
             y=dict(x)
@@ -3443,7 +3516,6 @@ with tabParlay:
             y["prebet_gate_v76"]=prebet_quality_gate_v76(y,use_odds=parlay_use_odds)
             y["parlay_odds"]=float(y.get("reference_odds") or y.get("model_target_odds") or (1.0/max(y.get("prob_low",.5),.01)))
 
-        # Una pierna candidata por juego. El perfil decide cómo puntuar cada mercado.
         def _parlay_leg_score(y):
             p=float(y.get("prob_low",y.get("prob",0)))
             conf=float(y.get("confidence_score",0))/100
@@ -3456,119 +3528,152 @@ with tabParlay:
                 return 5.0*p + 1.4*conf + 1.4*bq + .9*rel + .8*gate + .5*vol - .10*max(0,odd-2.2)
             if parlay_profile=="Equilibrado":
                 return 3.5*p + 1.1*conf + 1.2*bq + .7*rel + .45*gate + .35*vol + .32*min(odd,4.0)
-            # Mayor ganancia: momio pesa más, pero exige piso de probabilidad/calidad.
             if p < .43 or bq < .48: return -99
             return 2.25*p + .75*conf + .8*bq + .35*rel + .20*gate + .18*vol + .78*min(odd,6.0)
 
-        for y in enriched: y["parlay_leg_score"]=_parlay_leg_score(y)
-        # Menor riesgo intenta primero solo Gate PASS. Si no alcanza, deja claro el faltante.
-        if parlay_profile=="Menor riesgo":
-            preferred=[y for y in enriched if y.get("prebet_gate_v76",{}).get("pass",False)]
-        else:
-            preferred=[y for y in enriched if y.get("parlay_leg_score",-99)>-90]
+        for y in enriched:
+            y["parlay_leg_score"]=_parlay_leg_score(y)
 
-        best_by_game={}
-        for y in preferred:
-            gk=y.get("game_pk")
-            if gk not in best_by_game or y.get("parlay_leg_score",-99)>best_by_game[gk].get("parlay_leg_score",-99):
-                best_by_game[gk]=y
-        legs_pool=sorted(best_by_game.values(),key=lambda z:z.get("parlay_leg_score",-99),reverse=True)
-        selected_legs=legs_pool[:parlay_legs]
+        def _pick_signature(y):
+            return "|".join([
+                str(y.get("game_pk","")),str(y.get("market_family","")),str(y.get("player_id") or y.get("player") or ""),
+                str(y.get("side","")),str(y.get("line","")),str(y.get("label",""))
+            ])
 
-        # En equilibrado/ganancia, si faltan juegos por Gate/score, completa con el mejor de otros juegos y lo marca como riesgo.
-        if len(selected_legs)<parlay_legs and parlay_profile!="Menor riesgo":
-            used={x.get("game_pk") for x in selected_legs}
-            fallback_by_game={}
-            for y in enriched:
+        base_pool=[y for y in enriched if (y.get("prebet_gate_v76",{}).get("pass",False) if parlay_profile=="Menor riesgo" else y.get("parlay_leg_score",-99)>-90)]
+        used_signatures=set(); built=[]
+
+        for pidx in range(parlay_count):
+            available=[y for y in base_pool if (not parlay_avoid_repeat or _pick_signature(y) not in used_signatures)]
+            best_by_game={}
+            for y in available:
                 gk=y.get("game_pk")
-                if gk in used: continue
-                if gk not in fallback_by_game or y.get("parlay_leg_score",-99)>fallback_by_game[gk].get("parlay_leg_score",-99):
-                    fallback_by_game[gk]=y
-            for y in sorted(fallback_by_game.values(),key=lambda z:z.get("parlay_leg_score",-99),reverse=True):
-                selected_legs.append(y)
-                if len(selected_legs)>=parlay_legs: break
+                # tiny rotation penalty encourages different market choices on later tickets when scores are close
+                diversity_penalty=.025*pidx if _pick_signature(y) in used_signatures else 0.0
+                score=float(y.get("parlay_leg_score",-99))-diversity_penalty
+                if gk not in best_by_game or score>best_by_game[gk][0]:
+                    best_by_game[gk]=(score,y)
+            legs_pool=[pair[1] for pair in sorted(best_by_game.values(),key=lambda pair:pair[0],reverse=True)]
+            selected_legs=legs_pool[:parlay_legs]
 
-        st.session_state["v761_parlay_result"]={
-            "legs":selected_legs,"requested":parlay_legs,"profile":parlay_profile,"markets":parlay_market_choices,
-            "eligible":len(eligible),"complete":complete,"pending":pending,"errors":perrors,"usage":usage,
+            # Equilibrado/Mayor ganancia pueden completar con candidatos de otros juegos aunque sean amarillos.
+            if len(selected_legs)<parlay_legs and parlay_profile!="Menor riesgo":
+                current_games={x.get("game_pk") for x in selected_legs}
+                fallback_by_game={}
+                for y in enriched:
+                    sig=_pick_signature(y)
+                    gk=y.get("game_pk")
+                    if gk in current_games: continue
+                    if parlay_avoid_repeat and sig in used_signatures: continue
+                    if y.get("parlay_leg_score",-99)<=-90: continue
+                    if gk not in fallback_by_game or y.get("parlay_leg_score",-99)>fallback_by_game[gk].get("parlay_leg_score",-99):
+                        fallback_by_game[gk]=y
+                for y in sorted(fallback_by_game.values(),key=lambda z:z.get("parlay_leg_score",-99),reverse=True):
+                    selected_legs.append(y)
+                    current_games.add(y.get("game_pk"))
+                    if len(selected_legs)>=parlay_legs: break
+
+            if not selected_legs:
+                break
+            built.append({"legs":selected_legs,"requested":parlay_legs,"number":pidx+1})
+            if parlay_avoid_repeat:
+                used_signatures.update(_pick_signature(y) for y in selected_legs)
+
+        st.session_state["v763_parlay_results"]={
+            "parlays":built,"requested_parlays":parlay_count,"requested_legs":parlay_legs,"profile":parlay_profile,"markets":parlay_market_choices,
+            "avoid_repeat":parlay_avoid_repeat,"eligible":len(eligible),"complete":complete,"pending":pending,"errors":perrors,"usage":usage,
             "generated":len(candidates),"time":nowp.strftime("%H:%M:%S")
         }
+        # Evita mostrar un ticket viejo de V7.6.3 después de generar con la nueva lógica.
+        st.session_state.pop("v761_parlay_result",None)
 
-    pres=st.session_state.get("v761_parlay_result")
+    pres=st.session_state.get("v763_parlay_results")
     if pres:
+        parlays=pres.get("parlays",[])
+        full_count=sum(1 for p in parlays if len(p.get("legs",[]))>=pres.get("requested_legs",0))
         st.caption(f"Última búsqueda: {pres.get('time','')} CDMX · {pres.get('eligible',0)} juegos elegibles · {pres.get('generated',0)} mercados generados")
-        legs=pres.get("legs",[])
-        if len(legs)<pres.get("requested",0):
-            st.warning(f"Solo encontré {len(legs)} de {pres.get('requested',0)} juegos que cumplen el perfil **{pres.get('profile')}** con los filtros actuales. No rellené el parlay con picks peores solo para completar el número.")
-        if not legs:
-            st.info("No hay suficientes selecciones para construir el parlay con estos filtros. Prueba 'Completos o pendientes', más mercados o un perfil menos conservador.")
+        sm1,sm2,sm3=st.columns(3)
+        sm1.metric("Parlays construidos",f"{len(parlays)}/{pres.get('requested_parlays',0)}")
+        sm2.metric("Parlays completos",full_count)
+        sm3.metric("Sin repetir picks","Sí" if pres.get("avoid_repeat") else "No")
+        if len(parlays)<pres.get("requested_parlays",0) or full_count<len(parlays):
+            st.warning("No fue posible completar todos los tickets exactamente como los pediste con la calidad/filtros actuales. No forcé selecciones peores solo para llenar espacios.")
+        if not parlays:
+            st.info("No hay suficientes selecciones para construir parlays con estos filtros. Prueba 'Completos o pendientes', más mercados o un perfil menos conservador.")
         else:
-            st.markdown(f"### Parlay sugerido · {len(legs)} juegos · {pres.get('profile')}")
-            st.caption("Puedes cambiar línea, lado o momio. Después pulsa **Actualizar TODO el parlay** para recalcular probabilidades, Gate, Bet Quality y combinación.")
-            edit_specs=[]
-            for i,x in enumerate(legs,1):
-                gate=x.get("prebet_gate_v76",{})
-                status="🟢 Gate PASS" if gate.get("pass",False) else "🟡 Con riesgo"
-                st.markdown(f"**{i}. {x.get('game')} · {x.get('label')}**  \n{status} · Conservadora **{x.get('prob_low',x.get('prob',0))*100:.1f}%** · Confianza **{x.get('confidence_score',0):.0f}/100** · Bet Quality **{x.get('bet_quality_score',0):.0f}/100**")
-                default_odd=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.50)
-                if x.get("sample_values") is not None:
-                    with st.expander(f"✏️ Editar pierna {i}: línea / lado / momio",expanded=False):
-                        ec1,ec2,ec3=st.columns(3)
-                        eside=ec1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"v762_par_side_{i}_{x.get('game_pk')}")
-                        eline=ec2.number_input("Línea Draftea",value=float(x.get("line",.5)),step=.5,key=f"v762_par_line_{i}_{x.get('game_pk')}")
-                        eodd=ec3.number_input("Momio Draftea",min_value=1.01,max_value=100.0,value=float(round(default_odd,2)),step=.01,key=f"v762_par_odd_{i}_{x.get('game_pk')}")
-                        preview=v7_reprice_line(x,eline,eside)
-                        if preview:
-                            ppm=v7_price_metrics(preview,eodd)
-                            st.caption(f"Vista previa: central {preview.get('prob',0)*100:.1f}% · conservadora {preview.get('prob_low',0)*100:.1f}% · EV cons. {ppm.get('ev_cons',0)*100:+.1f}% · {ppm.get('verdict')}")
-                else:
-                    eside=x.get("side"); eline=x.get("line")
-                    eodd=st.number_input(f"Momio Draftea pierna {i}",min_value=1.01,max_value=100.0,value=float(round(default_odd,2)),step=.01,key=f"v762_par_odd_{i}_{x.get('game_pk')}")
-                edit_specs.append({"base":x,"side":eside,"line":eline,"odds":float(eodd)})
+            for pidx,pdata in enumerate(parlays,1):
+                legs=pdata.get("legs",[])
+                title=f"Parlay {pidx} · {len(legs)}/{pdata.get('requested',pres.get('requested_legs',0))} juegos · {pres.get('profile')}"
+                st.markdown(f"### 🎟️ {title}")
+                if len(legs)<pdata.get("requested",0):
+                    st.warning(f"Este ticket quedó con {len(legs)} de {pdata.get('requested',0)} piernas por falta de candidatos que cumplieran los filtros.")
+                st.caption("Puedes cambiar línea, lado o momio en cada pierna. Después pulsa el botón de este ticket para recalcular probabilidades, Gate, Bet Quality y combinación.")
 
-            if st.button("🔄 Actualizar TODO el parlay con mis cambios",type="primary",use_container_width=True,key="v762_update_parlay_all"):
-                newlegs=[]
-                for spec in edit_specs:
-                    base=spec["base"]
-                    if base.get("sample_values") is not None and spec.get("line") is not None:
-                        y=v7_reprice_line(base,float(spec["line"]),spec.get("side") or base.get("side","over")) or dict(base)
-                        y["manual_line_edited"]=bool(float(spec["line"])!=float(base.get("line",spec["line"])) or spec.get("side")!=base.get("side"))
+                edit_specs=[]
+                for i,x in enumerate(legs,1):
+                    gate=x.get("prebet_gate_v76",{})
+                    status="🟢 Gate PASS" if gate.get("pass",False) else "🟡 Con riesgo"
+                    st.markdown(f"**{i}. {x.get('game')} · {x.get('label')}**  \n{status} · Conservadora **{x.get('prob_low',x.get('prob',0))*100:.1f}%** · Confianza **{x.get('confidence_score',0):.0f}/100** · Bet Quality **{x.get('bet_quality_score',0):.0f}/100**")
+                    default_odd=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.50)
+                    keybase=f"v763_p{pidx}_leg{i}_{x.get('game_pk')}_{x.get('market_family')}"
+                    if x.get("sample_values") is not None:
+                        with st.expander(f"✏️ Editar Parlay {pidx} · pierna {i}: línea / lado / momio",expanded=False):
+                            ec1,ec2,ec3=st.columns(3)
+                            eside=ec1.selectbox("Lado",["over","under"],index=0 if x.get("side")=="over" else 1,format_func=lambda z:"Over / Más" if z=="over" else "Under / Menos",key=f"{keybase}_side")
+                            eline=ec2.number_input("Línea Draftea",value=float(x.get("line",.5)),step=.5,key=f"{keybase}_line")
+                            eodd=ec3.number_input("Momio Draftea",min_value=1.01,max_value=100.0,value=float(round(default_odd,2)),step=.01,key=f"{keybase}_odd")
+                            preview=v7_reprice_line(x,eline,eside)
+                            if preview:
+                                ppm=v7_price_metrics(preview,eodd)
+                                st.caption(f"Vista previa: central {preview.get('prob',0)*100:.1f}% · conservadora {preview.get('prob_low',0)*100:.1f}% · EV cons. {ppm.get('ev_cons',0)*100:+.1f}% · {ppm.get('verdict')}")
                     else:
-                        y=dict(base)
-                    y["reference_odds"]=None if y.get("manual_line_edited") else y.get("reference_odds")
-                    y=refresh_pick_v762(y,use_odds=False,manual_odds=float(spec["odds"]))
-                    y["parlay_odds"]=float(spec["odds"])
-                    newlegs.append(y)
-                pres=dict(pres); pres["legs"]=newlegs; pres["time"]=now_cdmx().strftime("%H:%M:%S")
-                st.session_state["v761_parlay_result"]=pres
-                st.success("Parlay actualizado: recalculé cada pierna y los totales usarán las líneas/momios nuevos.")
-                st.rerun()
+                        eside=x.get("side"); eline=x.get("line")
+                        eodd=st.number_input(f"Momio Draftea · Parlay {pidx} pierna {i}",min_value=1.01,max_value=100.0,value=float(round(default_odd,2)),step=.01,key=f"{keybase}_odd")
+                    edit_specs.append({"base":x,"side":eside,"line":eline,"odds":float(eodd)})
 
-            # Totales del ticket guardado/actual.
-            joint=1.0; combined=1.0
-            for x in legs:
-                joint*=float(x.get("prob_low",x.get("prob",0)))
-                combined*=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.0)
-            m1,m2,m3=st.columns(3)
-            m1.metric("Momio combinado",f"{combined:.2f}x")
-            m2.metric("Prob. conjunta conservadora",f"{joint*100:.1f}%")
-            m3.metric("Retorno por $100",f"${combined*100:,.0f}")
-            st.caption("La probabilidad conjunta es una aproximación multiplicando probabilidades conservadoras y asume independencia. Un parlay nunca es seguro; mercados correlacionados pueden cambiar el riesgo real.")
+                if st.button(f"🔄 Actualizar TODO el Parlay {pidx} con mis cambios",type="primary",use_container_width=True,key=f"v763_update_parlay_{pidx}"):
+                    newlegs=[]
+                    for spec in edit_specs:
+                        base=spec["base"]
+                        if base.get("sample_values") is not None and spec.get("line") is not None:
+                            y=v7_reprice_line(base,float(spec["line"]),spec.get("side") or base.get("side","over")) or dict(base)
+                            y["manual_line_edited"]=bool(float(spec["line"])!=float(base.get("line",spec["line"])) or spec.get("side")!=base.get("side"))
+                        else:
+                            y=dict(base)
+                        y["reference_odds"]=None if y.get("manual_line_edited") else y.get("reference_odds")
+                        y=refresh_pick_v762(y,use_odds=False,manual_odds=float(spec["odds"]))
+                        y["parlay_odds"]=float(spec["odds"])
+                        newlegs.append(y)
+                    newpres=dict(pres); newparlays=[dict(z) for z in parlays]
+                    newparlays[pidx-1]=dict(newparlays[pidx-1]); newparlays[pidx-1]["legs"]=newlegs
+                    newpres["parlays"]=newparlays; newpres["time"]=now_cdmx().strftime("%H:%M:%S")
+                    st.session_state["v763_parlay_results"]=newpres
+                    st.success(f"Parlay {pidx} actualizado: recalculé cada pierna y los totales con tus líneas/momios nuevos.")
+                    st.rerun()
 
-            with st.expander("🧪 Guardar este parlay en Paper Bets",expanded=False):
-                st.caption("Para poder liquidarlo correctamente con MLB, se guardan las piernas individualmente y quedan unidas por el mismo ID de parlay.")
-                pstake=st.number_input("Monto simulado por pierna (MXN)",min_value=5.0,max_value=10000.0,value=50.0,step=5.0,key="v762_parlay_paper_stake")
-                if st.button("🧊 Guardar todas las piernas en Paper Bets",use_container_width=True,key="v762_save_parlay_paper"):
-                    gid="PAR-"+hashlib.sha1(f"{selected_date}|{now_cdmx().isoformat()}".encode()).hexdigest()[:10]
-                    saved=0
-                    for x in legs:
-                        pod=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.80)
-                        rec=build_paper_record_v762(x,pod,pstake,selected_date,games,source="PARLAY",group_id=gid)
-                        if save_paper_record_v762(rec): saved+=1
-                    if saved==len(legs): st.success(f"Parlay guardado en Paper Bets: {saved} piernas · ID {gid}.")
-                    else: st.warning(f"Se guardaron {saved}/{len(legs)} piernas. Revisa persistencia/Supabase.")
+                joint=1.0; combined=1.0
+                for x in legs:
+                    joint*=float(x.get("prob_low",x.get("prob",0)))
+                    combined*=float(x.get("parlay_odds") or x.get("draftea_odds") or x.get("reference_odds") or x.get("model_target_odds") or 1.0)
+                m1,m2,m3=st.columns(3)
+                m1.metric("Momio combinado",f"{combined:.2f}x")
+                m2.metric("Prob. conjunta conservadora",f"{joint*100:.1f}%")
+                m3.metric("Retorno por $100",f"${combined*100:,.0f}")
+                st.caption("La probabilidad conjunta es una aproximación multiplicando probabilidades conservadoras y asume independencia. Un parlay nunca es seguro; mercados correlacionados pueden cambiar el riesgo real.")
+
+                with st.expander(f"🧪 Guardar Parlay {pidx} en Paper Bets",expanded=False):
+                    st.caption("Se guarda como UNA sola apuesta. Las piernas quedan dentro del ticket para poder liquidarlo, pero el monto, ROI y resultado cuentan una sola vez.")
+                    pstake=st.number_input("Monto simulado del parlay completo (MXN)",min_value=5.0,max_value=10000.0,value=50.0,step=5.0,key=f"v764_parlay_paper_stake_{pidx}")
+                    if st.button(f"🧊 Guardar Parlay {pidx} completo en Paper Bets",use_container_width=True,key=f"v764_save_parlay_paper_{pidx}"):
+                        rec=build_parlay_paper_record_v764(legs,pstake,selected_date,games,parlay_index=pidx)
+                        if save_paper_record_v762(rec):
+                            st.success(f"Parlay {pidx} guardado como 1 Paper Bet · {len(legs)} selecciones · {float(rec.get('odds',1)):.2f}x · ID {rec.get('paper_id')}.")
+                        else:
+                            st.warning("El parlay quedó en sesión, pero falló la persistencia externa/local.")
+                st.divider()
+
         if pres.get("errors"):
-            with st.expander("⚠️ Errores de análisis del parlay",expanded=False):
+            with st.expander("⚠️ Errores de análisis de Parlays",expanded=False):
                 for e in pres["errors"]: st.write("• "+e)
 
 with tab2:
@@ -3718,6 +3823,13 @@ with tab4:
             for rec in st.session_state["v653_paper_bets"]:
                 if rec.get("result") in ("WON","LOST","PUSH"):
                     continue
+                if rec.get("record_type")=="PARLAY" or rec.get("market_family")=="parlay":
+                    verdict,note,leg_states=settle_parlay_record_v764(rec)
+                    rec["result"]=verdict; rec["settlement_note"]=note; rec["leg_results"]=leg_states
+                    if verdict in ("WON","LOST","PUSH"):
+                        rec["status"]="SETTLED"
+                    persistent_upsert_paper_bet(rec); updated+=1
+                    continue
                 gr=get_game_result_v65(rec.get("game_pk"))
                 if gr.get("final"):
                     verdict,note=settle_market_v65(rec,gr)
@@ -3732,15 +3844,29 @@ with tab4:
         st.write(f"Paper Bets registradas: **{len(bets)}**")
         for rec in reversed(bets[-30:]):
             icon={"WON":"✅","LOST":"❌","PUSH":"↩️","PENDING":"⏳","UNSUPPORTED":"⚠️"}.get(rec.get("result"),"⏳")
-            st.write(
-                f"**{icon} {rec.get('game')} · {rec.get('market')} @ {float(rec.get('odds',0)):.2f}x** — "
-                f"{rec.get('game_time_cdmx','')} | apuesta ${float(rec.get('stake_mxn',0) or (float(rec.get('stake',1))*50)):,.2f} MXN | "
-                f"conservadora {float(rec.get('prob_low',0))*100:.1f}% | "
-                f"confianza {rec.get('confidence',0)}/100 | "
-                f"{'🟢 FINAL' if rec.get('freeze_type')=='FINAL' else '🟡 PRELIMINAR'} | "
-                f"lineups {'✅' if rec.get('both_lineups_confirmed') else '⚠️'} | "
-                f"{rec.get('result','PENDING')}"
-            )
+            if rec.get("record_type")=="PARLAY" or rec.get("market_family")=="parlay":
+                legs=rec.get("legs") or []
+                st.write(
+                    f"**🎟️ {icon} {rec.get('game')} @ {float(rec.get('odds',0)):.2f}x** — "
+                    f"apuesta ${float(rec.get('stake_mxn',0)):,.2f} MXN | retorno potencial ${float(rec.get('stake_mxn',0))*float(rec.get('odds',0)):,.2f} MXN | "
+                    f"{rec.get('result','PENDING')}"
+                )
+                with st.expander(f"▶ Ver {len(legs)} selecciones",expanded=False):
+                    leg_results={f"{x.get('game')}|{x.get('market')}":x for x in (rec.get('leg_results') or [])}
+                    for j,leg in enumerate(legs,1):
+                        lr=leg_results.get(f"{leg.get('game')}|{leg.get('market')}",{})
+                        li={"WON":"✅","LOST":"❌","PUSH":"↩️","PENDING":"⏳","UNSUPPORTED":"⚠️"}.get(lr.get("result"),"⏳")
+                        st.write(f"{j}. {li} **{leg.get('game')} · {leg.get('market')}** @ {float(leg.get('odds',0)):.2f}x" + (f" — {lr.get('note')}" if lr.get('note') else ""))
+            else:
+                st.write(
+                    f"**{icon} {rec.get('game')} · {rec.get('market')} @ {float(rec.get('odds',0)):.2f}x** — "
+                    f"{rec.get('game_time_cdmx','')} | apuesta ${float(rec.get('stake_mxn',0) or (float(rec.get('stake',1))*50)):,.2f} MXN | "
+                    f"conservadora {float(rec.get('prob_low',0))*100:.1f}% | "
+                    f"confianza {rec.get('confidence',0)}/100 | "
+                    f"{'🟢 FINAL' if rec.get('freeze_type')=='FINAL' else '🟡 PRELIMINAR'} | "
+                    f"lineups {'✅' if rec.get('both_lineups_confirmed') else '⚠️'} | "
+                    f"{rec.get('result','PENDING')}"
+                )
             freeze_bits=[]
             if rec.get("timestamp"):
                 freeze_bits.append(f"Congelada: {rec.get('timestamp')}")
@@ -3781,12 +3907,18 @@ with tab4:
             "away_abbr","home_abbr","market","category","odds","stake","stake_mxn","unit_value_mxn",
             "prob_central","prob_low","prob_high","confidence","agreement","confirmed","away_lineup_confirmed","home_lineup_confirmed","both_lineups_confirmed","away_lineup_count","home_lineup_count",
             "data_quality","readiness","readiness_level","freeze_type","status","result","settlement_note",
-            "paper_source","paper_group_id","manual_line_edited","line","side","market_family","subject","bet_quality_score","market_reliability"
+            "paper_source","paper_group_id","record_type","leg_count","legs_json","leg_results_json","manual_line_edited","line","side","market_family","subject","bet_quality_score","market_reliability"
         ]
         output=io.StringIO()
         writer=csv.DictWriter(output,fieldnames=fields,extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(bets)
+        export_rows=[]
+        for _r in bets:
+            _e=dict(_r)
+            _e["legs_json"]=json.dumps(_e.pop("legs",[]),ensure_ascii=False,default=str)
+            _e["leg_results_json"]=json.dumps(_e.pop("leg_results",[]),ensure_ascii=False,default=str)
+            export_rows.append(_e)
+        writer.writerows(export_rows)
         st.download_button(
             "⬇️ Descargar Paper Betting CSV",
             data=output.getvalue().encode("utf-8"),

@@ -1,29 +1,54 @@
-# MLB Betting Hub — V7.6.2 Alpha
+# MLB Betting Hub V7.6.4 Alpha — Paper Parlays completos
 
-## Qué cambia frente a V7.6.1
+V7.6.4 corrige la estructura de Paper Betting para parlays.
 
-### Paper Bets
-- Ahora puedes borrar **una Paper Bet individual** con confirmación, sin limpiar toda la lista.
-- Express tiene botón/expander para guardar directamente una selección en Paper Bets.
-- Parlays tiene opción para guardar sus piernas directamente en Paper Bets, unidas por un ID de parlay.
-- Se guardan metadatos de origen (`EXPRESS`, `PARLAY` o manual), línea, lado, familia de mercado y calidad.
-- La liquidación automática usa esos datos estructurados, por lo que una línea editada puede seguir resolviéndose correctamente.
+## Cambio principal
 
-### Express
-- Al editar lado, línea o momio, el botón ahora dice **Aplicar cambio y actualizar TODO Express**.
-- Recalcula: probabilidad central, conservadora, confianza, riesgo, confiabilidad del mercado, Bet Quality, Gate y ranking de Express.
-- También reconstruye el Top/fallback y la vista de ganador Full Game ML.
+Un parlay guardado desde la pestaña **Parlays** ahora se registra como **una sola Paper Bet completa**, no como varias apuestas individuales.
 
-### Parlays
-- Sigue siendo independiente de Express y analiza toda la jornada elegible.
-- Cada pierna permite editar línea/lado/momio cuando el mercado lo soporta.
-- Nuevo botón **Actualizar TODO el parlay con mis cambios**.
-- Recalcula cada pierna y después actualiza momio combinado y probabilidad conjunta conservadora.
-- Paper Betting guarda las piernas por separado para que MLB pueda liquidarlas individualmente, conservando un mismo ID de grupo de parlay.
+El registro padre conserva internamente todas sus piernas para poder resolverlas con MLB, pero el monto apostado, resultado, ROI, ganancia/pérdida y conteo de apuestas se contabilizan una sola vez.
+
+### Ejemplo
+
+Un parlay de 4 selecciones y $50 MXN se guarda como:
+
+- 1 Paper Bet
+- Momio combinado del ticket
+- $50 MXN apostados una sola vez
+- Retorno potencial del parlay completo
+- 4 piernas embebidas para liquidación
+
+En Paper Bets puede expandirse con **Ver N selecciones** para revisar cada pierna y su estado.
+
+## Liquidación
+
+- Si cualquier pierna pierde, el parlay completo queda LOST.
+- Si todavía faltan partidos y ninguna pierna perdió, queda PENDING.
+- Los PUSH no cuentan como derrota.
+- Si todas las piernas restantes ganan y no hay pendientes, el parlay queda WON.
+- Si todas fueran PUSH, queda PUSH.
+
+## Rendimiento
+
+Los parlays nuevos cuentan como una sola apuesta en Rendimiento, por lo que no inflan artificialmente número de apuestas, stake, ROI ni hit rate.
+
+## CSV
+
+Las piernas y sus resultados se exportan como JSON dentro del CSV (`legs_json` y `leg_results_json`) y se restauran al importar el archivo.
+
+## Se mantiene de V7.6.3
+
+- Multi-Parlays independientes de Express.
+- 1–5 parlays por búsqueda.
+- 2–8 juegos por parlay.
+- Perfiles Menor riesgo / Equilibrado / Mayor ganancia.
+- Mercados seleccionables.
+- Edición de líneas y momios con recálculo total.
+- Paper Bets individuales desde Express.
+- Eliminación individual de Paper Bets.
+- Statcast/Savant, Bet Quality, calibración y Gate de calidad.
+- Exclusión de partidos iniciados/Final en nuevas búsquedas.
 
 ## Persistencia
-- Sin Supabase: respaldo local para reruns en la misma instancia.
-- Con Supabase: Paper Bets sobreviven reinicios/redeploys.
 
-## Importante
-V7.6.2 sigue siendo una versión Alpha para validación/Paper Betting. Alta probabilidad no significa apuesta segura.
+El respaldo local sigue funcionando durante la misma instancia de Streamlit. Para persistencia tras reinicios/redeploys, configura Supabase con los Secrets ya utilizados en versiones anteriores.
