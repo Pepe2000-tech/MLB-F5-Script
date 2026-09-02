@@ -15,7 +15,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # ================= DATA LAYER =================
 BASE="https://statsapi.mlb.com/api/v1"
-HEADERS={"User-Agent":"MLB-Betting-Hub/7.0"}
+HEADERS={"User-Agent":"MLB-Betting-Hub/7.1.1"}
 CDMX_TZ=ZoneInfo("America/Mexico_City")
 
 def now_cdmx():
@@ -462,13 +462,14 @@ def get_lineups(game_pk):
     return result
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=15, show_spinner=False)
 def get_live_scoreboard(game_pk):
     """Estado LIVE de MLB para visualización. No modifica el modelo pregame."""
     if not game_pk:
-        return None
+        return {"error":"gamePk no disponible"}
     try:
-        feed=_get(f"{BASE}/game/{game_pk}/feed/live")
+        # IMPORTANTE: feed/live vive en StatsAPI v1.1, no en /api/v1.
+        feed=_get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
         gd=feed.get("gameData",{})
         ld=feed.get("liveData",{})
         status=(gd.get("status") or {})
@@ -476,16 +477,46 @@ def get_live_scoreboard(game_pk):
         teams=linescore.get("teams") or {}
         offense=linescore.get("offense") or {}
         defense=linescore.get("defense") or {}
-        count=linescore.get("balls",0),linescore.get("strikes",0),linescore.get("outs",0)
-        inning=linescore.get("currentInning")
-        half=linescore.get("inningHalf") or linescore.get("halfInning") or ""
+        plays=ld.get("plays") or {}
+        current_play=plays.get("currentPlay") or {}
+        play_count=current_play.get("count") or {}
+        result=current_play.get("result") or {}
+        about=current_play.get("about") or {}
+
+        balls=play_count.get("balls", linescore.get("balls",0))
+        strikes=play_count.get("strikes", linescore.get("strikes",0))
+        outs=play_count.get("outs", linescore.get("outs",0))
+        inning=linescore.get("currentInning") or about.get("inning")
+        half=linescore.get("inningHalf") or linescore.get("halfInning") or about.get("halfInning") or ""
+
         def runner(base_key):
-            x=offense.get(base_key)
-            return bool(x and (x.get("id") or x.get("fullName")))
+            x=offense.get(base_key) or {}
+            return bool(x.get("id") or x.get("fullName"))
+
         batter=offense.get("batter") or {}
         pitcher=defense.get("pitcher") or {}
+        matchup=current_play.get("matchup") or {}
+        if not batter:
+            batter=(matchup.get("batter") or {})
+        if not pitcher:
+            pitcher=(matchup.get("pitcher") or {})
+
+        pitch_count=None
+        try:
+            box=(ld.get("boxscore") or {}).get("teams") or {}
+            pid=pitcher.get("id")
+            for side in ("away","home"):
+                pd=(box.get(side) or {}).get("players",{}).get(f"ID{pid}",{}) if pid else {}
+                if pd:
+                    ps=(pd.get("stats") or {}).get("pitching") or {}
+                    pitch_count=ps.get("numberOfPitches")
+                    if pitch_count is not None: break
+        except Exception:
+            pitch_count=None
+
         return {
             "abstract":status.get("abstractGameState","Preview"),
+            "coded":status.get("codedGameState",""),
             "detailed":status.get("detailedState",""),
             "inning":inning,"half":half,
             "away_runs":int((teams.get("away") or {}).get("runs") or 0),
@@ -494,17 +525,22 @@ def get_live_scoreboard(game_pk):
             "home_hits":int((teams.get("home") or {}).get("hits") or 0),
             "away_errors":int((teams.get("away") or {}).get("errors") or 0),
             "home_errors":int((teams.get("home") or {}).get("errors") or 0),
-            "balls":int(count[0] or 0),"strikes":int(count[1] or 0),"outs":int(count[2] or 0),
+            "balls":int(balls or 0),"strikes":int(strikes or 0),"outs":int(outs or 0),
             "on_first":runner("first"),"on_second":runner("second"),"on_third":runner("third"),
             "batter":batter.get("fullName","N/D"),"pitcher":pitcher.get("fullName","N/D"),
+            "pitch_count":pitch_count,
+            "last_play":result.get("description") or result.get("event") or "",
         }
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error":f"{type(e).__name__}: {e}"}
 
 def render_live_scoreboard(game):
     live=get_live_scoreboard(game.get("game_pk"))
-    if not live:
-        st.info("Marcador LIVE no disponible en este momento.")
+    if not live or live.get("error"):
+        st.warning("No pude leer el feed LIVE de MLB para este partido.")
+        if live and live.get("error"):
+            with st.expander("Ver detalle técnico"):
+                st.code(live.get("error"))
         return
     state=live["abstract"]
     if state=="Live":
@@ -525,9 +561,12 @@ def render_live_scoreboard(game):
         st.markdown(f"<div style='text-align:center;font-size:26px'>{base2}<br>{base3}&nbsp;&nbsp;&nbsp;&nbsp;{base1}</div>",unsafe_allow_html=True)
         st.markdown(f"<div style='text-align:center'><b>{live['balls']}-{live['strikes']} · {live['outs']} outs</b></div>",unsafe_allow_html=True)
         x,y=st.columns(2)
-        x.caption(f"⚾ Pitcher: {live['pitcher']}")
+        pc=f" · {live['pitch_count']} lanzamientos" if live.get('pitch_count') is not None else ""
+        x.caption(f"⚾ Pitcher: {live['pitcher']}{pc}")
         y.caption(f"🏏 Bateador: {live['batter']}")
-    st.caption(f"R/H/E · {game['away_abbr']} {live['away_runs']}/{live['away_hits']}/{live['away_errors']} · {game['home_abbr']} {live['home_runs']}/{live['home_hits']}/{live['home_errors']} · refresco ~15 s")
+        if live.get("last_play"):
+            st.info(f"Última jugada: {live['last_play']}")
+    st.caption(f"R/H/E · {game['away_abbr']} {live['away_runs']}/{live['away_hits']}/{live['away_errors']} · {game['home_abbr']} {live['home_runs']}/{live['home_hits']}/{live['home_errors']} · refresco automático ~30 s")
 
 def _f(v,d=0.0):
     try:return float(v)
@@ -1675,12 +1714,12 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.1", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="MLB Betting Hub V7.1.1", page_icon="⚾", layout="wide")
 st_autorefresh(interval=30000, key="v653_refresh")
 
-st.title("⚾ MLB Betting Hub — V7.1 Alpha")
-st.caption("V7.1: valor por precio + momios de referencia + líneas editables + Express + parlays + LIVE + persistencia.")
-st.info("🆕 **V7.1 ALPHA** — Integra momios de referencia de mercado sin reemplazar el momio real de Draftea.")
+st.title("⚾ MLB Betting Hub — V7.1.1 Alpha")
+st.caption("V7.1.1: valor por precio + momios de referencia + líneas editables + Express + parlays + LIVE corregido + persistencia.")
+st.info("🛠️ **V7.1.1 ALPHA** — Corrige el feed LIVE de MLB (StatsAPI v1.1). No cambia el modelo estadístico ni los momios.")
 
 c1,c2=st.columns([1,2])
 with c1:
