@@ -1036,7 +1036,8 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
         if not p: continue
         ip=max(float(p.get("innings",0) or 0),0)
         k9_reg=shrink_mean(float(p.get("k9",LEAGUE_K9)),ip,LEAGUE_K9,50)
-        exp_ip=shrink_mean(float(p.get("expected_ip",5.2)),max(p.get("games_started",0),1),5.2,7)
+        exp_ip=shrink_mean(float(p.get("expected_ip",5.2)),max(p.get("games_started",0),1),5.15,12)
+        exp_ip=clamp(exp_ip,4.4,6.3)
         opp_rates=[];weights=[]
         lw=[1.10,1.08,1.06,1.04,1.02,1.00,.98,.96,.94]
         for idx,x in enumerate(opp_lineup[:9]):
@@ -1046,22 +1047,24 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
         opp_k=shrink_mean(raw_opp,len(weights)*70 if weights else 0,LEAGUE_K_PA,300)
         if p.get("k_rate"):
             k_skill=shrink_mean(float(p["k_rate"]),max(p.get("batters_faced",0),1),LEAGUE_K_PA,180)
-            k_skill_factor=clamp(k_skill/LEAGUE_K_PA,.82,1.22)
+            k_skill_factor=clamp(k_skill/LEAGUE_K_PA,.86,1.18)
         else:
-            k_skill_factor=clamp(k9_reg/LEAGUE_K9,.82,1.22)
-        mean_k=clamp((LEAGUE_K9*exp_ip/9)*k_skill_factor*clamp(opp_k/LEAGUE_K_PA,.88,1.13),1.5,9.8)
+            k_skill_factor=clamp(k9_reg/LEAGUE_K9,.86,1.18)
+        matchup_factor=clamp(opp_k/LEAGUE_K_PA,.91,1.10)
+        mean_k=clamp((LEAGUE_K9*exp_ip/9)*k_skill_factor*matchup_factor,1.5,9.2)
         rng=np.random.default_rng(stable_seed(name,"K-V7"))
-        cv=.16 if opp_lineup else .20; shape=1/(cv**2)
+        opp_lineup_confirmed = len(opp_lineup) >= 9 and lineups_confirmed
+        cv=.20 if opp_lineup_confirmed else .26; shape=1/(cv**2)
         ks=rng.poisson(rng.gamma(shape,mean_k/shape,size=16000))
         for line in [2.5,3.5,4.5,5.5,6.5]:
             for side,word in [("over","Over"),("under","Under")]:
-                prob=_sample_prob(ks,line,side); lo,hi=_bands_from_sample_prob(prob,True,"medium")
+                prob=_sample_prob(ks,line,side); lo,hi=_bands_from_sample_prob(prob,opp_lineup_confirmed,"medium")
                 props.append({
                     "category":"Pitcher Ks","label":f"{name} {word} {line:g} K",
-                    "prob":prob,"prob_low":lo,"prob_high":hi,"agreement":.88 if opp_lineup else .76,
-                    "quality":84 if opp_lineup else 76,"confirmed":True,"volatility":"medium",
+                    "prob":prob,"prob_low":lo,"prob_high":hi,"agreement":.86 if opp_lineup_confirmed else .68,
+                    "quality":86 if opp_lineup_confirmed else 68,"confirmed":opp_lineup_confirmed,"volatility":"medium",
                     "market_family":"pitcher_k","side":side,"line":line,"subject":name,"sample_values":ks,
-                    "reason":f"V7 O/U · media ~{mean_k:.1f} K · K/9 regresado {k9_reg:.2f} · IP ~{exp_ip:.1f} · K% rival {opp_k*100:.1f}%."
+                    "reason":f"V7.2.2 K audit · media ~{mean_k:.1f} K · K/9 regresado {k9_reg:.2f} · IP ~{exp_ip:.1f} · K% rival {opp_k*100:.1f}% · lineup rival {'confirmado' if opp_lineup_confirmed else 'provisional'}."
                 })
 
     def hitters(lineup):
@@ -1072,7 +1075,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
             split_adj=clamp(float(p.get("ops",LEAGUE_OPS))/LEAGUE_OPS,.88,1.12)
             rng=np.random.default_rng(stable_seed(p['name'],"HITTER-V7"))
 
-            # V7.2.1: simulate PA outcomes (1B/2B/3B/HR/out) instead of a Poisson shortcut for total bases.
+            # V7.2.2: simulate PA outcomes (1B/2B/3B/HR/out) instead of a Poisson shortcut for total bases.
             npa=max(1,int(round(pa)))
             pr_single=shrink_mean(clamp(float(p.get("single_rate",.145))*split_adj,0,.35),sample,.145,140)
             pr_double=shrink_mean(clamp(float(p.get("double_rate",.045))*split_adj,0,.16),sample,.045,160)
@@ -1109,7 +1112,7 @@ def build_prop_candidates_v7(away_pitcher,home_pitcher,away_pitcher_name,home_pi
                             "agreement":.90 if confirmed else .72,"quality":q if vol!="high" else max(55,q-12),
                             "confirmed":confirmed,"volatility":vol,"market_family":fam,"side":side,"line":line,
                             "subject":p['name'],"sample_values":vals,
-                            "reason":f"V7.2.1 O/U · ~{pa:.1f} PA · turno #{p['order']} · perfil 1B/2B/3B/HR + OPS/OBP/SLG regresado."
+                            "reason":f"V7.2.2 O/U · ~{pa:.1f} PA · turno #{p['order']} · perfil 1B/2B/3B/HR + OPS/OBP/SLG regresado."
                         })
     hitters(away_lineup);hitters(home_lineup)
     return props
@@ -1730,47 +1733,64 @@ def express_qualifies_v721(item,use_odds=False):
         return bool(item.get("reference_odds")) and item.get("reference_verdict")!="PASS"
     return True
 
-def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True):
-    """Safety-first diversity. If variety is unavailable, return fewer picks instead of filling with one market type."""
-    if not automatic:
-        return pool[:target_n]
-    selected=[]; game_counts={}; family_counts={}; player_counts={}
-    prop_fams={"pitcher_k","hits","total_bases","hrr","home_run"}
-    batter_fams={"hits","total_bases","hrr","home_run"}
-    # Hard caps: this deliberately prefers fewer picks over a Top dominated by pitcher/player props.
-    all_props_cap=max(1,math.ceil(target_n*.50))
-    pitcher_cap=max(1,math.ceil(target_n*.30))
-    batter_cap=max(1,math.ceil(target_n*.30))
-    family_cap=max(1,math.ceil(target_n*.30))
-    props=pitchers=batters=0
+def market_group_v722(item):
+    fam=str(item.get("market_family","") or "")
+    if fam.startswith("f5_"): return "F5 / juego"
+    if fam.startswith("fg_"): return "Full Game"
+    if fam=="pitcher_k": return "Pitcher props"
+    if fam in {"hits","total_bases","hrr","home_run"}: return "Batter props"
+    cat=str(item.get("category","") or "")
+    if "F5" in cat: return "F5 / juego"
+    if "Full Game" in cat: return "Full Game"
+    if "Pitcher" in cat: return "Pitcher props"
+    return "Batter props"
 
-    # First pass: try to take the strongest candidate from different market families.
-    seen_family=set()
-    ordered=[]
-    for x in pool:
-        fam=x.get("market_family","")
-        if fam not in seen_family:
-            ordered.append(x); seen_family.add(fam)
-    ordered += [x for x in pool if x not in ordered]
+def family_shortlist_v722(items, per_group=3):
+    """Preserva candidatos de cada familia antes del ranking global."""
+    enriched=[]
+    for item in items:
+        x=dict(item); x["confidence_score"]=confidence_score(x)
+        if x.get("prob_low",x.get("prob",0)) < .54 or x["confidence_score"] < 48: continue
+        x["express_group"]=market_group_v722(x); enriched.append(x)
+    out=[]
+    for group in ["F5 / juego","Full Game","Pitcher props","Batter props"]:
+        g=[x for x in enriched if x["express_group"]==group]
+        g=sorted(g,key=lambda x:(x.get("prob_low",0),x.get("confidence_score",0),x.get("prob",0)),reverse=True)
+        out.extend(g[:per_group])
+    return out
 
-    for x in ordered:
-        if len(selected)>=target_n: break
-        game=x.get("game"); fam=x.get("market_family",""); subj=x.get("subject","")
-        if game_counts.get(game,0)>=max_per_game: continue
-        is_prop=fam in prop_fams; is_pitch=fam=="pitcher_k"; is_batter=fam in batter_fams
-        if is_prop and props>=all_props_cap: continue
-        if is_pitch and pitchers>=pitcher_cap: continue
-        if is_batter and batters>=batter_cap: continue
-        if family_counts.get(fam,0)>=family_cap: continue
-        if is_prop and subj and player_counts.get(subj,0)>=1: continue
-        selected.append(x)
-        game_counts[game]=game_counts.get(game,0)+1
-        family_counts[fam]=family_counts.get(fam,0)+1
-        if is_prop:
-            props+=1
-            if subj: player_counts[subj]=1
-        if is_pitch: pitchers+=1
-        if is_batter: batters+=1
+def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_groups=None):
+    """V7.2.2: una sola familia no puede monopolizar Express."""
+    allowed_groups=set(allowed_groups or ["F5 / juego","Full Game","Pitcher props","Batter props"])
+    pool=[x for x in pool if market_group_v722(x) in allowed_groups]
+    if not automatic: return pool[:target_n]
+    selected=[]; game_counts={}; player_counts={}; group_counts={}
+    caps={
+        "Pitcher props": min(2,max(1,math.ceil(target_n*.20))),
+        "Batter props": max(1,math.ceil(target_n*.30)),
+        "F5 / juego": max(1,math.ceil(target_n*.40)),
+        "Full Game": min(2,max(1,math.ceil(target_n*.20))),
+    }
+    grouped={}
+    for x in pool: grouped.setdefault(market_group_v722(x),[]).append(x)
+    for g in grouped: grouped[g]=sorted(grouped[g],key=lambda z:z.get("express_safety_score",-9),reverse=True)
+    order=[g for g in ["F5 / juego","Batter props","Full Game","Pitcher props"] if g in allowed_groups]
+    idx={g:0 for g in order}; progress=True
+    while len(selected)<target_n and progress:
+        progress=False
+        for group in order:
+            if len(selected)>=target_n: break
+            if group_counts.get(group,0)>=caps.get(group,target_n): continue
+            arr=grouped.get(group,[])
+            while idx[group] < len(arr):
+                x=arr[idx[group]]; idx[group]+=1
+                game=x.get("game"); subj=x.get("subject","")
+                if game_counts.get(game,0)>=max_per_game: continue
+                if group in {"Pitcher props","Batter props"} and subj and player_counts.get(subj,0)>=1: continue
+                selected.append(x); progress=True
+                game_counts[game]=game_counts.get(game,0)+1; group_counts[group]=group_counts.get(group,0)+1
+                if group in {"Pitcher props","Batter props"} and subj: player_counts[subj]=1
+                break
     return selected
 
 # ================= V7 EXPRESS ENGINE =================
@@ -1824,7 +1844,7 @@ def analyze_game_express_v7(g,selected_date):
                           "market_family":"fg_total","side":side,"line":line,"sample_values":fgvals,"subject":f"{g['away_abbr']} @ {g['home_abbr']}"})
 
     items.extend(build_prop_candidates_v7(away_pitch,home_pitch,g['away_pitcher_name'],g['home_pitcher_name'],away_lineup,home_lineup,both))
-    ranked=rank_automatic_candidates_v5(items,max_items=8)
+    ranked=family_shortlist_v722(items,per_group=3)
     for x in ranked:
         x["game"]=g["label"];x["game_pk"]=g["game_pk"];x["game_time_cdmx"]=format_game_time_cdmx(g.get("game_time_local"));x["data_quality"]=q;x["both_lineups_confirmed"]=both
         # Precio mínimo como referencia de modelo; no se presenta como cuota de sportsbook.
@@ -1832,10 +1852,10 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.2.1", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.2.1 Alpha")
-st.caption("V7.2.1: Express safety-first + momios opcionales + edición aplicada dentro del Top + diversificación fuerte + Paper Betting persistente.")
-st.info("🧪 **V7.2.1 ALPHA** — Rediseño de flujo. No promete apuestas seguras: prioriza probabilidad conservadora, riesgo, calidad de datos y precio cuando está disponible.")
+st.set_page_config(page_title="MLB Betting Hub V7.2.2", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.2.2 Alpha")
+st.caption("V7.2.2: Express por familias + Pitcher K auditado + momios opcionales + contexto oculto + edición dentro del Top.")
+st.info("🧪 **V7.2.2 ALPHA** — Express ya no deja que Pitcher Ks monopolice el Top. Prioriza probabilidad conservadora, riesgo y calidad de datos; los momios son opcionales.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -1933,130 +1953,133 @@ props=build_prop_candidates_v7(
 # =========================
 # Contexto visible
 # =========================
-st.divider()
-st.subheader("📋 Contexto del partido")
-st.caption(f"🕒 Hora de inicio CDMX: **{format_game_time_cdmx(game.get('game_time_local'))}**")
+st.caption("ℹ️ Express usa el contexto automáticamente. Está oculto para mantener la pantalla simple.")
+with st.expander("🔍 Ver contexto del partido seleccionado", expanded=False):
+    st.divider()
+    st.subheader("📋 Contexto del partido")
+    st.caption(f"🕒 Hora de inicio CDMX: **{format_game_time_cdmx(game.get('game_time_local'))}**")
 
-ctx1,ctx2,ctx3=st.columns([1,1,1.1])
-with ctx1:
-    st.markdown(f"### ✈️ {game['away_abbr']}")
-    st.write(f"**Pitcher:** {game['away_pitcher_name']}")
-    if away_pitch:
-        st.caption(
-            f"{away_pitch['hand']}HP · ERA {away_pitch['era']:.2f} · WHIP {away_pitch['whip']:.2f} · "
-            f"K/9 {away_pitch['k9']:.2f} · BB/9 {away_pitch['bb9']:.2f} · HR/9 {away_pitch['hr9']:.2f}"
-        )
-    st.caption(f"Ofensiva {away_form['season_rpg']:.2f} R/G · últimos 15 {away_form['recent_rpg']:.2f}")
+    ctx1,ctx2,ctx3=st.columns([1,1,1.1])
+    with ctx1:
+        st.markdown(f"### ✈️ {game['away_abbr']}")
+        st.write(f"**Pitcher:** {game['away_pitcher_name']}")
+        if away_pitch:
+            st.caption(
+                f"{away_pitch['hand']}HP · ERA {away_pitch['era']:.2f} · WHIP {away_pitch['whip']:.2f} · "
+                f"K/9 {away_pitch['k9']:.2f} · BB/9 {away_pitch['bb9']:.2f} · HR/9 {away_pitch['hr9']:.2f}"
+            )
+        st.caption(f"Ofensiva {away_form['season_rpg']:.2f} R/G · últimos 15 {away_form['recent_rpg']:.2f}")
 
-with ctx2:
-    st.markdown(f"### 🏠 {game['home_abbr']}")
-    st.write(f"**Pitcher:** {game['home_pitcher_name']}")
-    if home_pitch:
-        st.caption(
-            f"{home_pitch['hand']}HP · ERA {home_pitch['era']:.2f} · WHIP {home_pitch['whip']:.2f} · "
-            f"K/9 {home_pitch['k9']:.2f} · BB/9 {home_pitch['bb9']:.2f} · HR/9 {home_pitch['hr9']:.2f}"
-        )
-    st.caption(f"Ofensiva {home_form['season_rpg']:.2f} R/G · últimos 15 {home_form['recent_rpg']:.2f}")
+    with ctx2:
+        st.markdown(f"### 🏠 {game['home_abbr']}")
+        st.write(f"**Pitcher:** {game['home_pitcher_name']}")
+        if home_pitch:
+            st.caption(
+                f"{home_pitch['hand']}HP · ERA {home_pitch['era']:.2f} · WHIP {home_pitch['whip']:.2f} · "
+                f"K/9 {home_pitch['k9']:.2f} · BB/9 {home_pitch['bb9']:.2f} · HR/9 {home_pitch['hr9']:.2f}"
+            )
+        st.caption(f"Ofensiva {home_form['season_rpg']:.2f} R/G · últimos 15 {home_form['recent_rpg']:.2f}")
 
-with ctx3:
-    st.markdown("### 🏟️ Estadio y clima")
-    st.write(f"**{(park or {}).get('name','N/D')}**")
-    st.caption(f"Park factor {(park or {}).get('factor',1.0):.2f}")
-    if weather:
-        st.caption(
-            f"🌡️ {weather['temp_f']:.0f}°F · 💨 {weather['wind_mph']:.0f} mph · "
-            f"💧 {weather['humidity']:.0f}% · 🌧️ {weather.get('precip_probability',0):.0f}%"
-        )
-    else: st.caption("Clima: N/D")
-    st.caption(f"Lineups: {game['away_abbr']} {'✅' if away_confirmed else '⚠️'} · {game['home_abbr']} {'✅' if home_confirmed else '⚠️'}")
+    with ctx3:
+        st.markdown("### 🏟️ Estadio y clima")
+        st.write(f"**{(park or {}).get('name','N/D')}**")
+        st.caption(f"Park factor {(park or {}).get('factor',1.0):.2f}")
+        if weather:
+            st.caption(
+                f"🌡️ {weather['temp_f']:.0f}°F · 💨 {weather['wind_mph']:.0f} mph · "
+                f"💧 {weather['humidity']:.0f}% · 🌧️ {weather.get('precip_probability',0):.0f}%"
+            )
+        else: st.caption("Clima: N/D")
+        st.caption(f"Lineups: {game['away_abbr']} {'✅' if away_confirmed else '⚠️'} · {game['home_abbr']} {'✅' if home_confirmed else '⚠️'}")
 
-st.markdown("### 👥 Lineups")
-lu1,lu2=st.columns(2)
-with lu1:
-    st.write(f"**{game['away_abbr']} — {'CONFIRMADO ✅' if away_confirmed else 'PENDIENTE ⚠️'}**")
-    if away_lineup:
-        for p in away_lineup[:9]:
-            src="split" if p.get("used_split") else "temporada"
-            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
-    else: st.caption("MLB todavía no publicó el orden al bat.")
-with lu2:
-    st.write(f"**{game['home_abbr']} — {'CONFIRMADO ✅' if home_confirmed else 'PENDIENTE ⚠️'}**")
-    if home_lineup:
-        for p in home_lineup[:9]:
-            src="split" if p.get("used_split") else "temporada"
-            st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
-    else: st.caption("MLB todavía no publicó el orden al bat.")
+    st.markdown("### 👥 Lineups")
+    lu1,lu2=st.columns(2)
+    with lu1:
+        st.write(f"**{game['away_abbr']} — {'CONFIRMADO ✅' if away_confirmed else 'PENDIENTE ⚠️'}**")
+        if away_lineup:
+            for p in away_lineup[:9]:
+                src="split" if p.get("used_split") else "temporada"
+                st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
+        else: st.caption("MLB todavía no publicó el orden al bat.")
+    with lu2:
+        st.write(f"**{game['home_abbr']} — {'CONFIRMADO ✅' if home_confirmed else 'PENDIENTE ⚠️'}**")
+        if home_lineup:
+            for p in home_lineup[:9]:
+                src="split" if p.get("used_split") else "temporada"
+                st.caption(f"{p['order']}. {p['name']} · OPS {p['ops']:.3f} ({src})")
+        else: st.caption("MLB todavía no publicó el orden al bat.")
 
-st.markdown("### 🧯 Bullpen y catcher")
-bp1,bp2=st.columns(2)
-with bp1:
-    catcher=next((p for p in away_lineup if p.get("position")=="C"),None)
-    st.write(f"**{game['away_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
-    if away_bp_work.get("available"):
-        st.caption(
-            f"Relevistas: {away_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
-            f"{away_bp_work['yesterday_pitches']} ayer · carga {workload_label(away_bp_work['fatigue_score'])} ({away_bp_work['fatigue_score']*100:.0f}%)"
-        )
-        if away_bp_work.get("heavy_arms"):
-            st.caption("Brazos cargados: "+", ".join(x["name"] for x in away_bp_work["heavy_arms"][:3]))
-    else: st.caption("Carga de bullpen: N/D")
-with bp2:
-    catcher=next((p for p in home_lineup if p.get("position")=="C"),None)
-    st.write(f"**{game['home_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
-    if home_bp_work.get("available"):
-        st.caption(
-            f"Relevistas: {home_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
-            f"{home_bp_work['yesterday_pitches']} ayer · carga {workload_label(home_bp_work['fatigue_score'])} ({home_bp_work['fatigue_score']*100:.0f}%)"
-        )
-        if home_bp_work.get("heavy_arms"):
-            st.caption("Brazos cargados: "+", ".join(x["name"] for x in home_bp_work["heavy_arms"][:3]))
-    else: st.caption("Carga de bullpen: N/D")
+    st.markdown("### 🧯 Bullpen y catcher")
+    bp1,bp2=st.columns(2)
+    with bp1:
+        catcher=next((p for p in away_lineup if p.get("position")=="C"),None)
+        st.write(f"**{game['away_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
+        if away_bp_work.get("available"):
+            st.caption(
+                f"Relevistas: {away_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
+                f"{away_bp_work['yesterday_pitches']} ayer · carga {workload_label(away_bp_work['fatigue_score'])} ({away_bp_work['fatigue_score']*100:.0f}%)"
+            )
+            if away_bp_work.get("heavy_arms"):
+                st.caption("Brazos cargados: "+", ".join(x["name"] for x in away_bp_work["heavy_arms"][:3]))
+        else: st.caption("Carga de bullpen: N/D")
+    with bp2:
+        catcher=next((p for p in home_lineup if p.get("position")=="C"),None)
+        st.write(f"**{game['home_abbr']}** · Catcher: {catcher['name'] if catcher else 'N/D'}")
+        if home_bp_work.get("available"):
+            st.caption(
+                f"Relevistas: {home_bp_work['total_pitches_3d']} pitcheos últimos 3 días · "
+                f"{home_bp_work['yesterday_pitches']} ayer · carga {workload_label(home_bp_work['fatigue_score'])} ({home_bp_work['fatigue_score']*100:.0f}%)"
+            )
+            if home_bp_work.get("heavy_arms"):
+                st.caption("Brazos cargados: "+", ".join(x["name"] for x in home_bp_work["heavy_arms"][:3]))
+        else: st.caption("Carga de bullpen: N/D")
 
-st.caption(
-    f"Última consulta: {now_cdmx().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
-    "refresco automático aproximado cada 2 minutos."
-)
+    st.caption(
+        f"Última consulta: {now_cdmx().strftime('%H:%M:%S')} · Calidad de datos {quality}/100 · "
+        "refresco automático aproximado cada 2 minutos."
+    )
 
-# Semáforo pregame V7
-ready=readiness_status(
-    game,quality,both_confirmed,weather,away_pitch,home_pitch,away_bp_work,home_bp_work
-)
-st.markdown("### 🚦 Estado para cerrar una predicción")
-r1,r2,r3=st.columns([1,1,1.6])
-r1.metric("Semáforo",f"{ready['icon']} {ready['label']}")
-r2.metric("Preparación",f"{ready['score']}/100")
-if ready.get("hours_to_game") is not None:
-    r3.metric("Tiempo al juego",f"{max(0,ready['hours_to_game']):.1f} h")
-else:
-    r3.metric("Tiempo al juego","N/D")
-st.caption(ready["advice"])
-if ready["reasons"]:
-    st.caption("Pendiente: " + " · ".join(ready["reasons"]))
-st.caption("V7.2.1 mejora la simulación de bateadores con perfil 1B/2B/3B/HR, OBP/SLG y splits disponibles. Statcast/Savant completo sigue pendiente de integración validada.")
+    # Semáforo pregame V7
+    ready=readiness_status(
+        game,quality,both_confirmed,weather,away_pitch,home_pitch,away_bp_work,home_bp_work
+    )
+    st.markdown("### 🚦 Estado para cerrar una predicción")
+    r1,r2,r3=st.columns([1,1,1.6])
+    r1.metric("Semáforo",f"{ready['icon']} {ready['label']}")
+    r2.metric("Preparación",f"{ready['score']}/100")
+    if ready.get("hours_to_game") is not None:
+        r3.metric("Tiempo al juego",f"{max(0,ready['hours_to_game']):.1f} h")
+    else:
+        r3.metric("Tiempo al juego","N/D")
+    st.caption(ready["advice"])
+    if ready["reasons"]:
+        st.caption("Pendiente: " + " · ".join(ready["reasons"]))
+    st.caption("V7.2.2 mejora la simulación de bateadores con perfil 1B/2B/3B/HR, OBP/SLG y splits disponibles. Statcast/Savant completo sigue pendiente de integración validada.")
 
-current_context_snapshot=make_context_snapshot(
-    game,away_pitch,home_pitch,away_lineup,home_lineup,weather,
-    away_bp_work,home_bp_work,f5_total,fg_total
-)
-changes=context_changes(st.session_state.get("v653_previous_context"),current_context_snapshot)
-if changes:
-    with st.expander("🆕 Qué cambió desde tu última actualización",expanded=True):
-        for ch in changes:
-            st.write(f"• {ch}")
+    current_context_snapshot=make_context_snapshot(
+        game,away_pitch,home_pitch,away_lineup,home_lineup,weather,
+        away_bp_work,home_bp_work,f5_total,fg_total
+    )
+    changes=context_changes(st.session_state.get("v653_previous_context"),current_context_snapshot)
+    if changes:
+        with st.expander("🆕 Qué cambió desde tu última actualización",expanded=True):
+            for ch in changes:
+                st.write(f"• {ch}")
 
-b1,b2,sp=st.columns([1,1,2.2])
-with b1:
-    update_now=st.button("🔄 Actualizar datos",use_container_width=True,type="secondary")
-with b2:
-    analyze_now=st.button("🧠 Analizar partido",use_container_width=True,type="primary")
+    b1,b2,sp=st.columns([1,1,2.2])
+    with b1:
+        update_now=st.button("🔄 Actualizar datos",use_container_width=True,type="secondary")
+    with b2:
+        analyze_now=st.button("🧠 Analizar partido",use_container_width=True,type="primary")
 
-if update_now:
-    st.session_state["v653_previous_context"]=current_context_snapshot
-    st.cache_data.clear()
-    st.session_state["v653_analysis_ready"]=False
-    st.rerun()
-if analyze_now:
-    st.session_state["v653_analysis_ready"]=True
+    if update_now:
+        st.session_state["v653_previous_context"]=current_context_snapshot
+        st.cache_data.clear()
+        st.session_state["v653_analysis_ready"]=False
+        st.rerun()
+    if analyze_now:
+        st.session_state["v653_analysis_ready"]=True
+
 
 # =========================
 # Construcción automática
@@ -2175,10 +2198,10 @@ with tab1:
     q1,q2,q3=st.columns([1,1,1.4])
     q1.metric("Calidad de datos",f"{quality}/100")
     q2.metric("Lineups","✅ Confirmados" if both_confirmed else "⚠️ Provisional")
-    q3.caption("V7.2.1 separa probabilidad, confianza y riesgo; no ordena solo por porcentaje central.")
+    q3.caption("V7.2.2 separa probabilidad, confianza y riesgo; no ordena solo por porcentaje central.")
 
     if not both_confirmed:
-        st.warning("Faltan lineups. V7.2.1 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
+        st.warning("Faltan lineups. V7.2.2 amplía automáticamente la incertidumbre y reduce la confianza de props/bateadores.")
 
     s1,s2,s3=st.columns(3)
     s1.metric("Mercados analizados",analysis_summary["total"])
@@ -2304,10 +2327,11 @@ with tabExpress:
     e1,e2,e3,e4=st.columns(4)
     target_n=int(e1.number_input("¿Cuántas apuestas buscas?",min_value=1,max_value=30,value=10,step=1))
     lineup_mode=e2.selectbox("Lineups",["Solo completos","Completos o pendientes"],index=0)
-    use_odds=e3.toggle("Usar momios de referencia",value=False,help="Apagado: V7.2.1 elige por probabilidad, confianza y riesgo. Encendido: además exige que el precio de mercado no sea un PASS. Solo al encenderlo consume créditos de The Odds API.")
-    diversify=e4.checkbox("Diversificación automática",value=True,help="Impide que el Top quede dominado por pitchers o props. Si no hay variedad suficiente, devuelve menos apuestas en lugar de rellenar.")
+    use_odds=e3.toggle("Usar momios de referencia",value=False,help="Apagado: elige por probabilidad, confianza y riesgo. Encendido: además valida el precio de mercado y consume créditos.")
+    diversify=e4.checkbox("Diversificación automática",value=True,help="Ranking por familias. Pitcher Ks ya no puede monopolizar el Top.")
+    allowed_groups=st.multiselect("Mercados a incluir",["F5 / juego","Full Game","Pitcher props","Batter props"],default=["F5 / juego","Full Game","Pitcher props","Batter props"],help="Puedes quitar Pitcher props por completo si no quieres apuestas de pitchers.")
     max_per_game=st.slider("Máximo de selecciones por partido",1,3,1)
-    st.caption("🎯 V7.2.1 prioriza automáticamente las selecciones de mayor probabilidad conservadora y menor riesgo. No necesitas elegir un 'objetivo'.")
+    st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si no hay calidad suficiente, devuelve menos picks; no rellena con pitchers.")
 
     nowx=now_cdmx()
     future_games=[g for g in games if game_is_pregame(g,nowx)]
@@ -2346,8 +2370,9 @@ with tabExpress:
             risk,ricon=risk_profile_v72(y); y["risk_label"]=risk; y["risk_icon"]=ricon
             enriched.append(y)
         # Safety-first pre-rank. Odds are completely optional.
+        enriched=[z for z in enriched if market_group_v722(z) in set(allowed_groups)]
         enriched=sorted(enriched,key=lambda z:(z.get("prob_low",0),z.get("confidence_score",0)),reverse=True)
-        prepool=enriched[:max(target_n*5,40)]
+        prepool=enriched[:max(target_n*8,60)]
 
         usage={}
         if use_odds and odds_api_enabled() and prepool:
@@ -2357,10 +2382,11 @@ with tabExpress:
             y["express_safety_score"]=express_safety_score_v721(y,use_odds=use_odds)
         qualified=[y for y in prepool if express_qualifies_v721(y,use_odds=use_odds)]
         qualified=sorted(qualified,key=lambda z:z.get("express_safety_score",-9),reverse=True)
-        chosen=diversify_express_v721(qualified,target_n,max_per_game=max_per_game,automatic=diversify)
+        chosen=diversify_express_v721(qualified,target_n,max_per_game=max_per_game,automatic=diversify,allowed_groups=allowed_groups)
         st.session_state["v7_express_results"]=chosen
         st.session_state["v721_use_odds"]=use_odds
         st.session_state["v72_express_lineup_mode"]=lineup_mode
+        st.session_state["v722_allowed_groups"]=allowed_groups
 
     counts=st.session_state.get("v72_express_counts")
     if counts:
@@ -2384,6 +2410,10 @@ with tabExpress:
     express=st.session_state.get("v7_express_results",[])
     if express:
         st.success(f"Top actual: {len(express)} oportunidades. Si pediste más y no aparecen, no hubo suficientes que calificaran.")
+        gd={}
+        for _x in express:
+            _g=market_group_v722(_x); gd[_g]=gd.get(_g,0)+1
+        st.caption("Distribución del Top: " + " · ".join(f"{g}: {n}" for g,n in gd.items()))
         for i,x in enumerate(express,1):
             risk=x.get("risk_label") or risk_profile_v72(x)[0]; ricon=x.get("risk_icon") or risk_profile_v72(x)[1]
             with st.container(border=True):
@@ -2552,7 +2582,7 @@ with tab2:
                     "timestamp":now_cdmx().strftime("%Y-%m-%d %H:%M:%S CDMX"),
                     "freeze_time_iso":now_cdmx().isoformat(timespec="seconds"),
                     "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,
-                    "model_version":"V7.2.1",
+                    "model_version":"V7.2.2",
                     "date":selected_date.isoformat(),
                     "game_pk":int(paper_choice.get("game_pk",0) or 0),
                     "game":paper_choice.get("game", pgame.get("label") if pgame else ""),
@@ -2779,6 +2809,6 @@ with tab5:
 
 st.divider()
 st.caption(
-    "V7.2.1 ALPHA. Alta probabilidad no significa apuesta segura. El objetivo es elevar selección y calibración, no prometer un porcentaje fijo de aciertos. "
+    "V7.2.2 ALPHA. Alta probabilidad no significa apuesta segura. El objetivo es elevar selección y calibración, no prometer un porcentaje fijo de aciertos. "
     "Paper Betting debe validar el modelo antes de aumentar riesgo real."
 )
