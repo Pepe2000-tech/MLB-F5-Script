@@ -1,4 +1,4 @@
-# MLB Betting Hub V7.2.3 Alpha
+# MLB Betting Hub V7.2.4 Alpha
 
 Corrección de Express:
 - Express ya no queda visualmente vacío: muestra mercados generados, comparados, cuántos calificaron y el Top mostrado.
@@ -10,4 +10,12 @@ Corrección de Express:
 - Contexto del partido permanece oculto por defecto.
 - Edición de línea dentro de Express se mantiene y pasa a Evaluar momios.
 
-V7.2.3 no garantiza resultados. El objetivo es hacer visible el análisis completo sin rellenar el Top con apuestas débiles.
+V7.2.4 no garantiza resultados. El objetivo es hacer visible el análisis completo sin rellenar el Top con apuestas débiles.
+
+
+## V7.2.4
+- Express ya no elimina candidatos demasiado pronto: siempre conserva mercados analizados.
+- Si no hay suficientes verdes, puede completar la vista con las alternativas de mayor probabilidad, claramente marcadas como riesgo.
+- Nueva sección “Ganador con mayor probabilidad por partido” para comparar directamente ambos equipos (ML).
+- “Máximo de selecciones por partido” ahora es un campo numérico 1–3, más fácil de usar que el slider.
+- La edición de línea/momio desde Express también funciona para alternativas de riesgo y se pasa a Evaluar momios.

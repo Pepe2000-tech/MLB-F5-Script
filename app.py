@@ -1745,18 +1745,22 @@ def market_group_v722(item):
     if "Pitcher" in cat: return "Pitcher props"
     return "Batter props"
 
-def family_shortlist_v722(items, per_group=3):
-    """Preserva candidatos de cada familia antes del ranking global."""
+def family_shortlist_v722(items, per_group=8):
+    """V7.2.4: preserva candidatos de TODAS las familias sin borrarlos por umbrales tempranos.
+    La clasificación APOSTAR/PASS se hace después. Así Express nunca aparenta no haber analizado.
+    """
     enriched=[]
     for item in items:
-        x=dict(item); x["confidence_score"]=confidence_score(x)
-        if x.get("prob_low",x.get("prob",0)) < .54 or x["confidence_score"] < 48: continue
-        x["express_group"]=market_group_v722(x); enriched.append(x)
+        x=dict(item)
+        x["confidence_score"]=confidence_score(x)
+        x["express_group"]=market_group_v722(x)
+        enriched.append(x)
     out=[]
     for group in ["F5 / juego","Full Game","Pitcher props","Batter props"]:
         g=[x for x in enriched if x["express_group"]==group]
         g=sorted(g,key=lambda x:(x.get("prob_low",0),x.get("confidence_score",0),x.get("prob",0)),reverse=True)
-        out.extend(g[:per_group])
+        # Mantiene un bloque amplio de cada familia para el ranking global y el fallback.
+        out.extend(g[:max(per_group,12)])
     return out
 
 def diversify_express_v721(pool,target_n,max_per_game=1,automatic=True,allowed_groups=None):
@@ -1859,10 +1863,10 @@ def analyze_game_express_v7(g,selected_date):
     return ranked,{"quality":q,"both":both}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.2.3", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.2.3 Alpha")
-st.caption("V7.2.3: Express por familias + Pitcher K auditado + momios opcionales + contexto oculto + edición dentro del Top.")
-st.info("🧪 **V7.2.3 ALPHA** — Express siempre muestra qué analizó: recomendados, cercanos y descartados. Full Game incluye ganador (Moneyline) y totales; los momios son opcionales.")
+st.set_page_config(page_title="MLB Betting Hub V7.2.4", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.2.4 Alpha")
+st.caption("V7.2.4: Express siempre devuelve un Top útil + ranking por familias + momios opcionales + edición dentro del Top.")
+st.info("🧪 **V7.2.4 ALPHA** — Si no hay picks verdes, Express muestra las mejores alternativas por probabilidad con su riesgo claramente marcado. Full Game incluye ganador (Moneyline) y totales.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -2337,8 +2341,9 @@ with tabExpress:
     use_odds=e3.toggle("Usar momios de referencia",value=False,help="Apagado: elige por probabilidad, confianza y riesgo. Encendido: además valida el precio de mercado y consume créditos.")
     diversify=e4.checkbox("Diversificación automática",value=True,help="Ranking por familias. Pitcher Ks ya no puede monopolizar el Top.")
     allowed_groups=st.multiselect("Mercados a incluir",["F5 / juego","Full Game","Pitcher props","Batter props"],default=["F5 / juego","Full Game","Pitcher props","Batter props"],help="F5 / juego incluye totales F5 y ganador F5. Full Game incluye totales y ganador Moneyline del partido completo. Puedes quitar cualquier familia.")
-    max_per_game=st.slider("Máximo de selecciones por partido",1,3,1)
-    st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si no hay calidad suficiente, devuelve menos picks; no rellena con pitchers.")
+    max_per_game=int(st.number_input("Máximo de selecciones por partido",min_value=1,max_value=3,value=1,step=1,help="Permite hasta 1, 2 o 3 selecciones del mismo juego dentro del Top."))
+    show_risky=st.toggle("Si no hay suficientes verdes, mostrar las mejores alternativas con riesgo",value=True,help="No las marca como seguras: simplemente muestra las de mayor probabilidad disponible con su nivel de riesgo y confianza.")
+    st.caption("🎯 Primero se rankea cada familia por separado y después se arma el Top. Si faltan picks verdes, puedes ver el mejor Top disponible aunque incluya riesgo.")
 
     nowx=now_cdmx()
     future_games=[g for g in games if game_is_pregame(g,nowx)]
@@ -2392,13 +2397,51 @@ with tabExpress:
         chosen=diversify_express_v721(qualified,target_n,max_per_game=max_per_game,automatic=diversify,allowed_groups=allowed_groups)
         chosen_ids={(z.get("game_pk"),z.get("label")) for z in chosen}
         near=[z for z in prepool if (z.get("game_pk"),z.get("label")) not in chosen_ids]
-        near=sorted(near,key=lambda z:z.get("express_safety_score",-9),reverse=True)[:max(8,target_n)]
+        near=sorted(near,key=lambda z:z.get("express_safety_score",-9),reverse=True)
+
+        # V7.2.4 fallback: si el usuario pidió N y hay menos verdes, completa SOLO la visualización
+        # con las mejores alternativas disponibles, respetando familias y máximo por partido.
+        fallback=[]
+        if show_risky and len(chosen)<target_n:
+            needed=target_n-len(chosen)
+            # Para mercados de juego prioriza además el lado ML con mayor probabilidad de cada partido.
+            # Esto responde a: "entre los dos equipos, dime cuál tiene mayor probabilidad".
+            ranked_near=sorted(near,key=lambda z:(z.get("prob_low",0),z.get("confidence_score",0),z.get("prob",0)),reverse=True)
+            existing=list(chosen)
+            game_counts={}
+            for z in existing: game_counts[z.get("game")]=game_counts.get(z.get("game"),0)+1
+            for z in ranked_near:
+                if len(fallback)>=needed: break
+                if game_counts.get(z.get("game"),0)>=max_per_game: continue
+                fallback.append(z)
+                game_counts[z.get("game")]=game_counts.get(z.get("game"),0)+1
+        shown_all=chosen+fallback
+        # Mejor ganador por partido (Full Game ML preferido; F5 ML si Full Game no está habilitado).
+        winner_pool=[z for z in prepool if z.get("market_family") in {"fg_ml","f5_ml"}]
+        best_winners=[]
+        by_game={}
+        for z in winner_pool:
+            fam=z.get("market_family")
+            # Respeta los mercados elegidos por el usuario.
+            if fam=="fg_ml" and "Full Game" not in allowed_groups: continue
+            if fam=="f5_ml" and "F5 / juego" not in allowed_groups: continue
+            key=(z.get("game"),fam)
+            if key not in by_game or z.get("prob",0)>by_game[key].get("prob",0): by_game[key]=z
+        # Si hay Full Game, evita duplicar F5 del mismo juego en esta vista de ganador.
+        games_with_fg={k[0] for k in by_game if k[1]=="fg_ml"}
+        for (gm,fam),z in by_game.items():
+            if fam=="f5_ml" and gm in games_with_fg: continue
+            best_winners.append(z)
+        best_winners=sorted(best_winners,key=lambda z:(z.get("prob_low",0),z.get("prob",0)),reverse=True)
+        st.session_state["v724_best_winners"]=best_winners
         st.session_state["v7_express_results"]=chosen
-        st.session_state["v723_express_near"]=near
-        st.session_state["v723_express_stats"]={"markets":len(allp),"prepool":len(prepool),"qualified":len(qualified),"shown":len(chosen)}
+        st.session_state["v724_express_fallback"]=fallback
+        st.session_state["v723_express_near"]=near[:max(12,target_n*2)]
+        st.session_state["v723_express_stats"]={"markets":len(allp),"prepool":len(prepool),"qualified":len(qualified),"shown":len(shown_all),"greens":len(chosen),"fallback":len(fallback)}
         st.session_state["v721_use_odds"]=use_odds
         st.session_state["v72_express_lineup_mode"]=lineup_mode
         st.session_state["v722_allowed_groups"]=allowed_groups
+        st.session_state["v724_show_risky"]=show_risky
 
     counts=st.session_state.get("v72_express_counts")
     if counts:
@@ -2420,23 +2463,39 @@ with tabExpress:
         st.caption("🧠 The Odds API no está configurada; Express puede funcionar sin momios usando probabilidad + confianza + riesgo.")
 
     express=st.session_state.get("v7_express_results",[])
+    fallback=st.session_state.get("v724_express_fallback",[])
+    display_express=express+fallback
     estats=st.session_state.get("v723_express_stats")
     if estats:
         q1,q2,q3,q4=st.columns(4)
         q1.metric("Mercados generados",estats.get("markets",0))
         q2.metric("Comparados",estats.get("prepool",0))
-        q3.metric("Calificaron",estats.get("qualified",0))
+        q3.metric("Verdes / APOSTAR",estats.get("greens",estats.get("qualified",0)))
         q4.metric("Top mostrado",estats.get("shown",0))
-    if express:
-        st.success(f"Top actual: {len(express)} oportunidades. Si pediste más y no aparecen, no hubo suficientes que calificaran.")
+    best_winners=st.session_state.get("v724_best_winners",[])
+    if best_winners and ("Full Game" in st.session_state.get("v722_allowed_groups",[]) or "F5 / juego" in st.session_state.get("v722_allowed_groups",[])):
+        with st.expander("🏆 Ganador con mayor probabilidad por partido — aunque no llegue a verde", expanded=False):
+            st.caption("Aquí V7 compara los dos equipos y muestra el lado con mayor probabilidad del modelo. Si no alcanza nivel verde, se marca como riesgo y NO como apuesta segura.")
+            for z in best_winners[:15]:
+                rr,ri=risk_profile_v72(z)
+                st.markdown(f"**{z.get('game','')} → {z.get('label','')}** · Central {z.get('prob',0)*100:.1f}% · Conservadora {z.get('prob_low',0)*100:.1f}% · Conf. {z.get('confidence_score',0)}/100 · {ri} {rr}")
+    if display_express:
+        if express:
+            st.success(f"🟢 {len(express)} selecciones alcanzaron nivel APOSTAR.")
+        if fallback:
+            st.warning(f"🟡 Añadí {len(fallback)} alternativas de mayor probabilidad para completar el Top. Tienen más riesgo o menor confianza: no son equivalentes a un verde.")
         gd={}
-        for _x in express:
+        for _x in display_express:
             _g=market_group_v722(_x); gd[_g]=gd.get(_g,0)+1
         st.caption("Distribución del Top: " + " · ".join(f"{g}: {n}" for g,n in gd.items()))
-        for i,x in enumerate(express,1):
+        green_keys={(z.get("game_pk"),z.get("label")) for z in express}
+        for i,x in enumerate(display_express,1):
             risk=x.get("risk_label") or risk_profile_v72(x)[0]; ricon=x.get("risk_icon") or risk_profile_v72(x)[1]
+            is_green=(x.get("game_pk"),x.get("label")) in green_keys
+            status_txt="🟢 APOSTAR" if is_green else "🟡 MAYOR PROBABILIDAD / CON RIESGO"
             with st.container(border=True):
                 st.markdown(f"### {i}. {x['game']} · {x['label']}")
+                st.caption(f"**{status_txt}**")
                 m1,m2,m3,m4=st.columns(4)
                 m1.metric("Prob. central",f"{x.get('prob',0)*100:.1f}%")
                 m2.metric("Conservadora",f"{x.get('prob_low',0)*100:.1f}%")
@@ -2479,25 +2538,25 @@ with tabExpress:
                                 # Old reference quote may correspond to another line; do not carry it over as if it matched.
                                 rx["reference_odds"]=None
                                 rx["reference_ev_cons"]=None
+                                old_key=(x.get("game_pk"),x.get("label"))
                                 current=list(st.session_state.get("v7_express_results",[]))
-                                if 0 <= i-1 < len(current):
-                                    current[i-1]=rx
-                                    st.session_state["v7_express_results"]=current
+                                fb=list(st.session_state.get("v724_express_fallback",[]))
+                                replaced=False
+                                for arr_name,arr in [("green",current),("fallback",fb)]:
+                                    for kk,z in enumerate(arr):
+                                        if (z.get("game_pk"),z.get("label"))==old_key:
+                                            arr[kk]=rx; replaced=True; break
+                                    if replaced: break
+                                st.session_state["v7_express_results"]=current
+                                st.session_state["v724_express_fallback"]=fb
                                 st.success("Ajuste guardado. Evaluar momios usará esta línea y este momio de Draftea.")
                                 st.rerun()
                     
     else:
         if estats:
-            st.warning("No hubo apuestas que alcanzaran el nivel 🟢 APOSTAR con estos filtros. Eso NO significa que Express no haya analizado.")
-            near=st.session_state.get("v723_express_near",[])
-            if near:
-                st.markdown("### 🟡 Mejores alternativas analizadas — todavía NO califican")
-                st.caption("Se muestran para que veas qué estuvo más cerca. No se convierten automáticamente en recomendación.")
-                for j,x in enumerate(near[:10],1):
-                    grp=market_group_v722(x)
-                    st.markdown(f"**{j}. {x.get('game','')} · {x.get('label','')}** — {grp} · Conservadora {x.get('prob_low',0)*100:.1f}% · Confianza {x.get('confidence_score',0)}/100")
+            st.warning("No encontré candidatos utilizables con esos mercados/filtros. Si 'Mercados generados' es 0, hay un problema de generación de candidatos y no una ausencia real de juegos.")
         else:
-            st.info("Ejecuta Express. Puede devolver menos apuestas de las solicitadas si no hay suficientes con el nivel requerido.")
+            st.info("Ejecuta Express para ver el Top disponible en este momento.")
 
 with tabParlay:
     st.subheader("🎟️ Constructor de Parlays — todos los juegos")
@@ -2539,7 +2598,7 @@ with tabParlay:
 
 with tab2:
     st.subheader("💵 Evaluar momios — usa exactamente lo que ajustaste en Express")
-    express_eval=list(st.session_state.get("v7_express_results",[]))
+    express_eval=list(st.session_state.get("v7_express_results",[]))+list(st.session_state.get("v724_express_fallback",[]))
     source_is_express=bool(express_eval)
     source_candidates=express_eval if source_is_express else (ranked_auto if st.session_state.get("v653_analysis_ready",False) else [])
 
