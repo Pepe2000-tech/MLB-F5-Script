@@ -2722,7 +2722,7 @@ def build_paper_record_v762(item,odds,stake_mxn,selected_date,games,source="MANU
     pid=hashlib.sha1(f"{item.get('game_pk')}|{item.get('label')}|{source}|{stamp.isoformat()}".encode()).hexdigest()[:12]
     return {
         "paper_id":pid,"timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.8","date":selected_date.isoformat(),
+        "hours_to_game_at_freeze":round(float(htg),2) if htg is not None else None,"model_version":"V7.6.9","date":selected_date.isoformat(),
         "game_pk":int(item.get("game_pk",0) or 0),"game":item.get("game",pgame.get("label") if pgame else ""),
         "game_time_cdmx":format_game_time_cdmx(pgame.get("game_time_local")) if pgame else "",
         "away_abbr":pgame.get("away_abbr","") if pgame else "","home_abbr":pgame.get("home_abbr","") if pgame else "",
@@ -2770,7 +2770,7 @@ def build_parlay_paper_record_v764(legs,stake_mxn,selected_date,games,parlay_ind
     return {
         "paper_id":gid,"record_type":"PARLAY","paper_source":"PARLAY","paper_group_id":gid,
         "timestamp":stamp.strftime("%Y-%m-%d %H:%M:%S CDMX"),"freeze_time_iso":stamp.isoformat(timespec="seconds"),
-        "model_version":"V7.6.8","date":selected_date.isoformat(),"game_pk":0,
+        "model_version":"V7.6.9","date":selected_date.isoformat(),"game_pk":0,
         "game":f"Parlay {parlay_index} · {len(leg_records)} selecciones",
         "game_time_cdmx":"Varios juegos","away_abbr":"","home_abbr":"",
         "market":f"PARLAY {len(leg_records)} LEGS","category":"Parlay","market_family":"parlay",
@@ -2991,10 +2991,10 @@ def analyze_game_express_v7(g,selected_date,allowed_groups=None):
     return ranked,{"quality":q,"both":both,"statcast":sc_count>0,"statcast_count":sc_count,"statcast_coverage":sc_cov}
 
 # ================= APP UI =================
-st.set_page_config(page_title="MLB Betting Hub V7.6.8", page_icon="⚾", layout="wide")
-st.title("⚾ MLB Betting Hub — V7.6.8 Alpha")
-st.caption("V7.6.8: Añade F5 Manual para capturar la línea y momios reales de Draftea y analizarlos con el motor completo.")
-st.info("✍️ **V7.6.8 ALPHA — F5 MANUAL** — Puedes escribir la línea y los momios reales de Draftea para F5. El motor recalcula Over y Under sobre esa línea exacta usando la misma proyección, simulación, incertidumbre y guard de calibración del analizador avanzado.")
+st.set_page_config(page_title="MLB Betting Hub V7.6.9", page_icon="⚾", layout="wide")
+st.title("⚾ MLB Betting Hub — V7.6.9 Alpha")
+st.caption("V7.6.9: F5 Manual muestra claramente el partido seleccionado y compara hasta 4 líneas reales de Draftea (Over/Under) en una sola corrida.")
+st.info("✍️ **V7.6.9 ALPHA — F5 MANUAL x4** — Captura hasta 4 líneas reales de Draftea para el partido seleccionado. El motor compara Over y Under de cada línea (hasta 8 opciones) usando la misma simulación y filtros avanzados.")
 
 c1,c2=st.columns([1,2])
 with c1:
@@ -3338,87 +3338,117 @@ tabExpress,tabManualF5,tab1,tab2,tabParlay,tab4,tab5=st.tabs([
 ])
 
 with tabManualF5:
-    st.subheader("✍️ F5 Manual — línea real de Draftea")
-    st.caption("Selecciona el partido arriba y escribe exactamente la línea y los momios que ves en Draftea. Aquí NO se inventan líneas: se analiza únicamente la que tú captures.")
+    st.subheader("✍️ F5 Manual — líneas reales de Draftea")
+    st.markdown(f"### ⚾ Partido seleccionado: **{game['away_abbr']} @ {game['home_abbr']}**")
+    st.caption(f"{game.get('label', game['away_abbr']+' @ '+game['home_abbr'])} · {format_game_time_cdmx(game.get('game_time_local'))} · Lineups {'✅ confirmados' if both_confirmed else '⚠️ pendientes'}")
+    st.caption("Captura exactamente las líneas y momios que ves en Draftea. Puedes comparar 4 líneas a la vez; se evalúan Over y Under de cada una, hasta 8 opciones reales.")
 
-    mf1,mf2,mf3=st.columns([1,1,1])
-    manual_line=float(mf1.number_input("Línea F5 de Draftea",min_value=0.5,max_value=15.5,value=4.5,step=1.0,key=f"v768_f5_line_{game['game_pk']}"))
-    manual_over_odds=float(mf2.number_input("Momio Over",min_value=1.01,max_value=100.0,value=1.90,step=0.01,format="%.2f",key=f"v768_f5_over_odds_{game['game_pk']}"))
-    manual_under_odds=float(mf3.number_input("Momio Under",min_value=1.01,max_value=100.0,value=1.90,step=0.01,format="%.2f",key=f"v768_f5_under_odds_{game['game_pk']}"))
+    st.markdown("#### 📝 Captura hasta 4 líneas F5")
+    defaults=[3.5,4.5,5.5,6.5]
+    manual_specs=[]
+    hdr=st.columns([0.55,1,1,1])
+    hdr[0].markdown("**Usar**")
+    hdr[1].markdown("**Línea F5**")
+    hdr[2].markdown("**Momio Over**")
+    hdr[3].markdown("**Momio Under**")
+    for _i,_default in enumerate(defaults, start=1):
+        _c0,_c1,_c2,_c3=st.columns([0.55,1,1,1])
+        _use=_c0.checkbox(f"#{_i}",value=True,key=f"v769_f5_use_{game['game_pk']}_{_i}",label_visibility="visible")
+        _line=float(_c1.number_input(f"Línea {_i}",min_value=0.5,max_value=15.5,value=float(_default),step=0.5,key=f"v769_f5_line_{game['game_pk']}_{_i}",label_visibility="collapsed"))
+        _over=float(_c2.number_input(f"Over {_i}",min_value=1.01,max_value=100.0,value=1.90,step=0.01,format="%.2f",key=f"v769_f5_over_{game['game_pk']}_{_i}",label_visibility="collapsed"))
+        _under=float(_c3.number_input(f"Under {_i}",min_value=1.01,max_value=100.0,value=1.90,step=0.01,format="%.2f",key=f"v769_f5_under_{game['game_pk']}_{_i}",label_visibility="collapsed"))
+        if _use:
+            manual_specs.append({"slot":_i,"line":_line,"over_odds":_over,"under_odds":_under})
 
-    st.caption(f"Modelo base actual: **{game['away_abbr']} {away_f5:.2f} + {game['home_abbr']} {home_f5:.2f} = {f5_total:.2f} carreras F5** · Lineups {'✅ confirmados' if both_confirmed else '⚠️ pendientes'} · Calidad {quality}/100")
+    st.caption(f"Modelo base actual: **{game['away_abbr']} {away_f5:.2f} + {game['home_abbr']} {home_f5:.2f} = {f5_total:.2f} carreras F5** · Calidad {quality}/100")
 
-    if st.button("🧠 Analizar línea F5 manual",key=f"v768_analyze_manual_f5_{game['game_pk']}",type="primary",use_container_width=True):
-        manual_results=[]
-        for _side,_word,_odds in [("over","Over",manual_over_odds),("under","Under",manual_under_odds)]:
-            _center=sim_total_prob(f5_sim,manual_line,_side)
-            _scenario=scenario_total_probs(away_models,home_models,manual_line,_side)
-            _p,_lo,_hi,_agreement=conservative_probability(_center,_scenario,quality,both_confirmed,"medium")
-            _item={
-                "category":"F5","label":f"F5 {_word} {manual_line:g}",
-                "prob":_p,"prob_low":_lo,"prob_high":_hi,"agreement":_agreement,
-                "quality":quality,"data_quality":quality,"confirmed":both_confirmed,"both_lineups_confirmed":both_confirmed,
-                "volatility":"medium","market_family":"f5_total","side":_side,"line":manual_line,
-                "subject":f"{game['away_abbr']} @ {game['home_abbr']}","sample_values":f5_sim["total"],
-                "game":game["label"],"game_pk":game["game_pk"],
-                "reason":f"Línea manual Draftea · Monte Carlo 24k · total F5 proyectado {f5_total:.2f}."
-            }
-            _item["market_reliability"]=market_reliability_v74(_item)
-            _item=apply_market_calibration_v75(_item)
-            _item=probability_guard_v767(_item)
-            _item["confidence_score"]=confidence_score(_item)
-            _item["market_reliability"]=market_reliability_v74(_item)
-            _item["bet_quality_score"]=bet_quality_score_v75(_item,True)
-            _price=v7_price_metrics(_item,_odds)
-            _item["manual_odds"]=_odds
-            _item["price_metrics"]=_price
-            manual_results.append(_item)
-        st.session_state[f"v768_manual_f5_results_{game['game_pk']}"]=manual_results
+    _lines=[round(float(x['line']),3) for x in manual_specs]
+    if len(_lines)!=len(set(_lines)):
+        st.warning("Tienes líneas F5 repetidas. Puedes analizarlas, pero normalmente conviene capturar cada línea de Draftea una sola vez.")
 
-    manual_results=st.session_state.get(f"v768_manual_f5_results_{game['game_pk']}",[])
-    if manual_results:
-        # Si el usuario cambia la línea o momios, avisamos para evitar usar una lectura vieja sin darse cuenta.
-        stale=any(abs(float(x.get("line",0))-manual_line)>.001 or abs(float(x.get("manual_odds",0))-(manual_over_odds if x.get("side")=="over" else manual_under_odds))>.001 for x in manual_results)
-        if stale:
-            st.warning("Cambiaste la línea o los momios. Pulsa **Analizar línea F5 manual** para actualizar el resultado.")
+    if st.button("🧠 Analizar las líneas F5",key=f"v769_analyze_manual_f5_{game['game_pk']}",type="primary",use_container_width=True):
+        if not manual_specs:
+            st.warning("Activa al menos una línea para analizar.")
         else:
-            ranked_manual=sorted(manual_results,key=lambda x:(x["price_metrics"]["verdict"]=="APOSTAR",x["price_metrics"]["ev_cons"],x.get("prob_low",0)),reverse=True)
+            manual_results=[]
+            for _spec in manual_specs:
+                _line=float(_spec["line"])
+                for _side,_word,_odds in [("over","Over",float(_spec["over_odds"])),("under","Under",float(_spec["under_odds"]))]:
+                    _center=sim_total_prob(f5_sim,_line,_side)
+                    _scenario=scenario_total_probs(away_models,home_models,_line,_side)
+                    _p,_lo,_hi,_agreement=conservative_probability(_center,_scenario,quality,both_confirmed,"medium")
+                    _item={
+                        "category":"F5","label":f"F5 {_word} {_line:g}",
+                        "prob":_p,"prob_low":_lo,"prob_high":_hi,"agreement":_agreement,
+                        "quality":quality,"data_quality":quality,"confirmed":both_confirmed,"both_lineups_confirmed":both_confirmed,
+                        "volatility":"medium","market_family":"f5_total","side":_side,"line":_line,
+                        "subject":f"{game['away_abbr']} @ {game['home_abbr']}","sample_values":f5_sim["total"],
+                        "game":game["label"],"game_pk":game["game_pk"],"manual_slot":int(_spec["slot"]),
+                        "reason":f"Línea manual Draftea · Monte Carlo 24k · total F5 proyectado {f5_total:.2f}."
+                    }
+                    _item["market_reliability"]=market_reliability_v74(_item)
+                    _item=apply_market_calibration_v75(_item)
+                    _item=probability_guard_v767(_item)
+                    _item["confidence_score"]=confidence_score(_item)
+                    _item["market_reliability"]=market_reliability_v74(_item)
+                    _item["bet_quality_score"]=bet_quality_score_v75(_item,True)
+                    _price=v7_price_metrics(_item,_odds)
+                    _item["manual_odds"]=_odds
+                    _item["price_metrics"]=_price
+                    manual_results.append(_item)
+            st.session_state[f"v769_manual_f5_results_{game['game_pk']}"]=manual_results
+            st.session_state[f"v769_manual_f5_specs_{game['game_pk']}"]=[dict(x) for x in manual_specs]
+
+    manual_results=st.session_state.get(f"v769_manual_f5_results_{game['game_pk']}",[])
+    _saved_specs=st.session_state.get(f"v769_manual_f5_specs_{game['game_pk']}",[])
+    if manual_results:
+        def _spec_signature(_arr):
+            return sorted((int(x.get('slot',0)),round(float(x.get('line',0)),3),round(float(x.get('over_odds',0)),3),round(float(x.get('under_odds',0)),3)) for x in _arr)
+        stale=_spec_signature(manual_specs)!=_spec_signature(_saved_specs)
+        if stale:
+            st.warning("Cambiaste una línea, un momio o qué filas están activas. Pulsa **Analizar las líneas F5** para actualizar el ranking.")
+        else:
+            ranked_manual=sorted(manual_results,key=lambda x:(x["price_metrics"]["verdict"]=="APOSTAR",x["price_metrics"]["verdict"]=="CANDIDATO",x["price_metrics"]["ev_cons"],x.get("prob_low",0)),reverse=True)
             best=ranked_manual[0]
             best_price=best["price_metrics"]
-            if best_price["verdict"]=="APOSTAR":
-                st.success(f"✅ MEJOR OPCIÓN: **{best['label']} @ {best['manual_odds']:.2f}x**")
-            elif best_price["verdict"]=="CANDIDATO":
-                st.warning(f"🟡 MEJOR CANDIDATO: **{best['label']} @ {best['manual_odds']:.2f}x**")
-            else:
-                st.info("⚪ **PASS** — Con estos momios, ninguna de las dos direcciones tiene suficiente respaldo/precio para apostar.")
 
-            for _item in ranked_manual:
+            st.markdown("### 🏆 Resultado rápido")
+            if best_price["verdict"]=="APOSTAR":
+                st.success(f"✅ **MEJOR F5: {best['label']} @ {best['manual_odds']:.2f}x** · Conservadora {best['prob_low']*100:.1f}% · EV {best_price['ev_cons']*100:+.1f}%")
+            elif best_price["verdict"]=="CANDIDATO":
+                st.warning(f"🟡 **MEJOR CANDIDATA: {best['label']} @ {best['manual_odds']:.2f}x** · Conservadora {best['prob_low']*100:.1f}% · EV {best_price['ev_cons']*100:+.1f}%")
+            else:
+                st.info("⚪ **PASS** — Ninguna de las líneas capturadas tiene suficiente respaldo/precio para apostar según el modelo actual.")
+
+            st.markdown("#### 📋 Todas las opciones, ordenadas")
+            for _rank,_item in enumerate(ranked_manual, start=1):
                 _pm=_item["price_metrics"]
                 _icon="🟢" if _pm["verdict"]=="APOSTAR" else "🟡" if _pm["verdict"]=="CANDIDATO" else "⚪"
-                with st.container(border=True):
-                    st.markdown(f"### {_icon} {_item['label']} @ {_item['manual_odds']:.2f}x")
-                    r1,r2,r3,r4=st.columns(4)
-                    r1.metric("Prob. ajustada",f"{_item['prob']*100:.1f}%")
-                    r2.metric("Conservadora",f"{_item['prob_low']*100:.1f}%")
-                    r3.metric("Momio justo",f"{_pm['fair_cons']:.2f}x")
-                    r4.metric("EV conservador",f"{_pm['ev_cons']*100:+.1f}%")
-                    st.caption(f"Modelo crudo {_item.get('prob_model_raw',_item['prob'])*100:.1f}% · Confianza {_item['confidence_score']}/100 · Bet Quality {_item['bet_quality_score']}/100 · Reliability {_item['market_reliability']}/100 · Veredicto **{_pm['verdict']}**")
-                    if _pm["verdict"]=="APOSTAR":
-                        st.write("El precio capturado supera el mínimo exigido por el modelo conservador.")
-                    elif _pm["verdict"]=="CANDIDATO":
-                        st.write("La línea es defendible, pero el margen es pequeño. Úsala solo si aceptas más riesgo.")
-                    else:
-                        st.write("La probabilidad y/o el precio no compensan suficientemente el riesgo según el modelo actual.")
-                    with st.expander("🧪 Guardar esta F5 en Paper Bets",expanded=False):
-                        _stake=st.number_input("Apuesta simulada (MXN)",min_value=1.0,max_value=10000.0,value=5.0,step=1.0,key=f"v768_stake_{game['game_pk']}_{_item['side']}")
-                        if st.button("🧊 Guardar F5 manual",key=f"v768_save_{game['game_pk']}_{_item['side']}",use_container_width=True):
-                            _save=dict(_item)
-                            _save["manual_line_edited"]=True
-                            _rec=build_paper_record_v762(_save,float(_item["manual_odds"]),float(_stake),selected_date,games,source="F5_MANUAL")
-                            save_paper_record_v762(_rec)
-                            st.success("Paper Bet guardada con la línea y momio manuales exactos.")
+                st.markdown(f"**{_rank}. {_icon} {_item['label']} @ {_item['manual_odds']:.2f}x** — conservadora {_item['prob_low']*100:.1f}% · ajustada {_item['prob']*100:.1f}% · EV {_pm['ev_cons']*100:+.1f}% · **{_pm['verdict']}**")
 
-            with st.expander("🔬 Ver por qué el modelo piensa eso",expanded=False):
+            with st.expander("🔬 Ver análisis detallado de las opciones",expanded=False):
+                for _rank,_item in enumerate(ranked_manual, start=1):
+                    _pm=_item["price_metrics"]
+                    _icon="🟢" if _pm["verdict"]=="APOSTAR" else "🟡" if _pm["verdict"]=="CANDIDATO" else "⚪"
+                    with st.container(border=True):
+                        st.markdown(f"### {_rank}. {_icon} {_item['label']} @ {_item['manual_odds']:.2f}x")
+                        r1,r2,r3,r4=st.columns(4)
+                        r1.metric("Prob. ajustada",f"{_item['prob']*100:.1f}%")
+                        r2.metric("Conservadora",f"{_item['prob_low']*100:.1f}%")
+                        r3.metric("Momio justo",f"{_pm['fair_cons']:.2f}x")
+                        r4.metric("EV conservador",f"{_pm['ev_cons']*100:+.1f}%")
+                        st.caption(f"Modelo crudo {_item.get('prob_model_raw',_item['prob'])*100:.1f}% · Confianza {_item['confidence_score']}/100 · Bet Quality {_item['bet_quality_score']}/100 · Reliability {_item['market_reliability']}/100 · Veredicto **{_pm['verdict']}**")
+                        with st.expander("🧪 Guardar esta F5 en Paper Bets",expanded=False):
+                            _safe_line=str(_item['line']).replace('.','_')
+                            _stake=st.number_input("Apuesta simulada (MXN)",min_value=1.0,max_value=10000.0,value=5.0,step=1.0,key=f"v769_stake_{game['game_pk']}_{_item['side']}_{_safe_line}")
+                            if st.button("🧊 Guardar F5 manual",key=f"v769_save_{game['game_pk']}_{_item['side']}_{_safe_line}",use_container_width=True):
+                                _save=dict(_item)
+                                _save["manual_line_edited"]=True
+                                _rec=build_paper_record_v762(_save,float(_item["manual_odds"]),float(_stake),selected_date,games,source="F5_MANUAL")
+                                save_paper_record_v762(_rec)
+                                st.success("Paper Bet guardada con la línea y momio manuales exactos.")
+
+                st.markdown("#### Contexto del modelo")
                 st.write(f"Proyección F5: {game['away_abbr']} {away_f5:.2f} · {game['home_abbr']} {home_f5:.2f} · Total {f5_total:.2f}")
                 st.write(f"Submodelos de total F5: {', '.join(f'{x+y:.2f}' for x,y in zip(away_models,home_models))}")
                 st.write(f"Incertidumbre Monte Carlo (CV): {f5_sim['cv']:.3f}")
